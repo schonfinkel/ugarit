@@ -367,6 +367,101 @@ fn isDirty(repo: ?*c.git_repository) Error!bool {
     return c.git_status_list_entrycount(list) > 0;
 }
 
+// --- enclosing-repo helpers (for the `info/exclude` integration) ------------
+
+/// Path of the enclosing repository dir (`…/.git`) for an absolute path, or
+/// null when `start` is not inside a worktree. Caller frees.
+/// The start path need not exist: discovery retries on its parent (ugarit
+/// excludes *before* creating the link).
+pub fn discoverRepo(a: std.mem.Allocator, start: []const u8) Error!?[:0]u8 {
+    if (try discoverRepoExisting(a, start)) |p| return p;
+    const parent = std.fs.path.dirname(start) orelse return null;
+    return discoverRepoExisting(a, parent);
+}
+
+fn discoverRepoExisting(a: std.mem.Allocator, start: []const u8) Error!?[:0]u8 {
+    var start_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const start_z = std.fmt.bufPrintZ(&start_buf, "{s}", .{start}) catch {
+        copyMsg("start path too long");
+        return error.Git;
+    };
+    var buf: c.git_buf = .{};
+    defer c.git_buf_dispose(&buf);
+    const rc = c.git_repository_discover(&buf, start_z, 0, null);
+    if (rc == c.GIT_ENOTFOUND) return null;
+    try check(rc);
+    if (buf.ptr == null) return error.Git;
+    const dup: [:0]u8 = try a.dupeZ(u8, std.mem.span(buf.ptr));
+    return dup;
+}
+
+/// The repository workdir as an absolute path with a trailing `/`.
+pub fn repoWorkdir(a: std.mem.Allocator, repo_dir: [:0]const u8) Error![:0]u8 {
+    const repo = try openRepo(repo_dir);
+    defer c.git_repository_free(repo);
+    const wd = c.git_repository_workdir(repo);
+    if (wd == null) return error.Git; // bare repo: no worktree to link into
+    return a.dupeZ(u8, std.mem.span(wd));
+}
+
+/// The common dir (`…/.git` also for linked worktrees) with a trailing `/`.
+pub fn repoCommondir(a: std.mem.Allocator, repo_dir: [:0]const u8) Error![:0]u8 {
+    const repo = try openRepo(repo_dir);
+    defer c.git_repository_free(repo);
+    const cd = c.git_repository_commondir(repo);
+    if (cd == null) return error.Git;
+    return a.dupeZ(u8, std.mem.span(cd));
+}
+
+fn openRepo(dir: [:0]const u8) Error!?*c.git_repository {
+    var repo: ?*c.git_repository = null;
+    try check(c.git_repository_open(&repo, dir.ptr));
+    return repo;
+}
+
+fn relZ(buf: *[std.fs.max_path_bytes]u8, rel: []const u8) Error![*:0]const u8 {
+    return std.fmt.bufPrintZ(buf, "{s}", .{rel}) catch {
+        copyMsg("relative path too long");
+        return error.Git;
+    };
+}
+
+/// True when `rel` is tracked (in the index), directly or as a parent dir of
+/// tracked files — edge case 44. `git_status_file` cannot answer for
+/// directories, and the index only lists files, so both shapes are checked.
+pub fn isPathTracked(repo_dir: [:0]const u8, rel: []const u8) Error!bool {
+    const repo = try openRepo(repo_dir);
+    defer c.git_repository_free(repo);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel_z = try relZ(&buf, rel);
+    var index: ?*c.git_index = null;
+    try check(c.git_repository_index(&index, repo));
+    defer c.git_index_free(index);
+    if (c.git_index_get_bypath(index, rel_z, 0) != null) return true;
+    const n = c.git_index_entrycount(index);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const entry = c.git_index_get_byindex(index, i) orelse continue;
+        if (entry.*.path == null) continue;
+        const p = std.mem.span(@as([*:0]const u8, @ptrCast(entry.*.path)));
+        if (p.len > rel.len + 1 and std.mem.startsWith(u8, p, rel) and p[rel.len] == '/') return true;
+    }
+    return false;
+}
+
+/// True when `rel` is already ignored by that repo (edge case 45).
+pub fn isPathIgnored(repo_dir: [:0]const u8, rel: []const u8) Error!bool {
+    const repo = try openRepo(repo_dir);
+    defer c.git_repository_free(repo);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rel_z = try relZ(&buf, rel);
+    var ignored: c_int = 0;
+    const rc = c.git_ignore_path_is_ignored(&ignored, repo, rel_z);
+    if (rc == c.GIT_ENOTFOUND) return false;
+    try check(rc);
+    return ignored == 1;
+}
+
 // --- fixtures (test-only scaffolding; never referenced by the CLI) ------------
 
 /// libgit2-backed fixtures. Referenced from `test` blocks and property tests
