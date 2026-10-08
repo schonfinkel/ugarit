@@ -1,6 +1,7 @@
 # Ugarit
 
-[![built with nix](https://builtwithnix.org/badge.svg)](https://builtwithnix.org)
+[![Built with Nix](https://builtwithnix.org/badge.svg)](https://builtwithnix.org)
+[![\[Nix\] Build and Test](https://github.com/schonfinkel/ugarit/actions/workflows/build.yml/badge.svg)](https://github.com/schonfinkel/ugarit/actions/workflows/build.yml)
 
 Ugarit is a small CLI for discovering skills in Git repositories and linking them into the directories used by coding agents. It keeps one managed clone of each source, records links per host, and repairs links after upstream moves.
 
