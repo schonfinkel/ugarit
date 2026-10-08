@@ -38,6 +38,18 @@
       perSystem =
         { pkgs, lib, ... }:
         let
+          zonVersionPattern = ''[[:space:]]*\.version[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*,[[:space:]]*'';
+          zonVersionMatches = builtins.filter (match: match != null) (
+            map (line: builtins.match zonVersionPattern line) (
+              lib.splitString "\n" (builtins.readFile ./build.zig.zon)
+            )
+          );
+          version =
+            if builtins.length zonVersionMatches == 1 then
+              builtins.head (builtins.head zonVersionMatches)
+            else
+              throw "build.zig.zon must contain exactly one .version = \"...\", line";
+
           zigVersion = pkgs.zig_0_16;
           zigDependencies = pkgs.callPackage ./build.zig.zon.nix { };
           staticTarget =
@@ -76,7 +88,7 @@
           packages = {
             default = pkgs.stdenv.mkDerivation {
               pname = "ugarit";
-              version = "0.1.0";
+              inherit version;
               src = ./.;
               nativeBuildInputs = [
                 zigVersion.hook
@@ -93,7 +105,7 @@
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             static = pkgs.pkgsStatic.stdenv.mkDerivation {
               pname = "ugarit-static";
-              version = "0.1.0";
+              inherit version;
               src = ./.;
               nativeBuildInputs = [
                 zigVersion
@@ -121,7 +133,7 @@
 
           checks.default = pkgs.stdenv.mkDerivation {
             pname = "ugarit-check";
-            version = "0.1.0";
+            inherit version;
             src = ./.;
             nativeBuildInputs = [
               zigVersion
