@@ -1,32 +1,209 @@
 const std = @import("std");
-const git2 = @import("git2");
+const ugarit = @import("ugarit");
+const structargs = @import("zigcli").structargs;
 
-// git2/common.h git_feature_t bits (enum in C, so referenced numerically here)
-const feature_threads: c_int = 1 << 0;
-const feature_https: c_int = 1 << 1;
-const feature_ssh: c_int = 1 << 2;
+const Cli = struct {
+    @"config-dir": ?[]const u8 = null,
+    help: bool = false,
+    version: bool = false,
+
+    __commands__: union(enum) {
+        @"source-add": struct {
+            name: ?[]const u8 = null,
+            ref: ?[]const u8 = null,
+            help: bool = false,
+        },
+        @"source-sync": struct {
+            help: bool = false,
+        },
+        link: struct {
+            as: ?[]const u8 = null,
+            force: bool = false,
+            mkdir: bool = false,
+            @"no-exclude": bool = false,
+            help: bool = false,
+        },
+        unlink: struct {
+            skill: ?[]const u8 = null,
+            help: bool = false,
+        },
+        list: struct {
+            source: ?[]const u8 = null,
+            links: bool = false,
+            help: bool = false,
+        },
+
+        pub const __messages__ = .{
+            .@"source-add" = "Register and clone a Git repository source: <url>",
+            .@"source-sync" = "Fetch and fast-forward sources, then repair links: [name]",
+            .link = "Symlink a skill into directories: <skill> <dest-dir>...",
+            .unlink = "Remove managed links: <link-path>... | --skill <name>",
+            .list = "List skills and link status: [skill]",
+        };
+    },
+
+    pub const __shorts__ = .{ .help = .h };
+    pub const __messages__ = .{
+        .@"config-dir" = "Override the ugarit configuration directory",
+        .help = "Print help",
+        .version = "Print version",
+    };
+};
 
 pub fn main(init: std.process.Init) !u8 {
-    _ = git2.git_libgit2_init();
-    defer _ = git2.git_libgit2_shutdown();
-
-    var major: c_int = 0;
-    var minor: c_int = 0;
-    var rev: c_int = 0;
-    _ = git2.git_libgit2_version(&major, &minor, &rev);
-    const features = git2.git_libgit2_features();
+    const a = init.gpa;
+    const io = init.io;
+    var parsed = structargs.parse(a, io, init.minimal.args, Cli, .{
+        .version_string = "ugarit " ++ ugarit.app.version,
+        .print_help_on_error = true,
+    }) catch return 2;
+    defer parsed.deinit();
 
     const stdout_file = std.Io.File.stdout();
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = stdout_file.writer(init.io, &stdout_buffer);
+    var stdout_writer = stdout_file.writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
+    const stderr_file = std.Io.File.stderr();
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_writer = stderr_file.writer(io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
 
-    try stdout.print("ugarit 0.1.0 (libgit2 {d}.{d}.{d})\n", .{ major, minor, rev });
-    try stdout.print("features: threads={}, https={}, ssh={}\n", .{
-        features & feature_threads != 0,
-        features & feature_https != 0,
-        features & feature_ssh != 0,
-    });
+    ugarit.git.init(init.environ_map) catch |err| {
+        try report(stderr, err);
+        try stderr.flush();
+        return 1;
+    };
+    defer ugarit.git.deinit();
+
+    var ctx = ugarit.app.Context.init(
+        a,
+        io,
+        init.environ_map,
+        parsed.options.@"config-dir",
+        stdout,
+        stderr,
+    ) catch |err| {
+        try report(stderr, err);
+        try stderr.flush();
+        return ugarit.app.diagnosticExitCode(ugarit.app.diagnostic(err));
+    };
+    defer ctx.deinit();
+
+    const args = parsed.positional_arguments;
+    const ok = dispatch(&ctx, parsed.options.__commands__, args) catch |err| {
+        try report(stderr, err);
+        try stdout.flush();
+        try stderr.flush();
+        return ugarit.app.diagnosticExitCode(ugarit.app.diagnostic(err));
+    };
     try stdout.flush();
-    return 0;
+    try stderr.flush();
+    return if (ok) 0 else 1;
+}
+
+fn dispatch(ctx: *ugarit.app.Context, command: @FieldType(Cli, "__commands__"), args: []const [:0]const u8) !bool {
+    return switch (command) {
+        .@"source-add" => |options| blk: {
+            var parsed = ugarit.app.SourceAddOptions{ .name = options.name, .ref = options.ref };
+            var url: ?[]const u8 = null;
+            var i: usize = 0;
+            while (i < args.len) : (i += 1) {
+                const arg = args[i];
+                if (std.mem.eql(u8, arg, "--name") or std.mem.eql(u8, arg, "--ref")) {
+                    i += 1;
+                    if (i == args.len) return error.Usage;
+                    if (std.mem.eql(u8, arg, "--name")) parsed.name = args[i] else parsed.ref = args[i];
+                } else if (std.mem.startsWith(u8, arg, "--")) {
+                    return error.Usage;
+                } else if (url == null) {
+                    url = arg;
+                } else return error.Usage;
+            }
+            try ugarit.app.sourceAdd(ctx, url orelse return error.Usage, parsed);
+            break :blk true;
+        },
+        .@"source-sync" => blk: {
+            if (args.len > 1 or (args.len == 1 and std.mem.startsWith(u8, args[0], "--"))) return error.Usage;
+            break :blk try ugarit.app.sourceSync(ctx, if (args.len == 1) args[0] else null);
+        },
+        .link => |options| blk: {
+            var parsed = ugarit.app.LinkOptions{
+                .as = options.as,
+                .force = options.force,
+                .mkdir = options.mkdir,
+                .no_exclude = options.@"no-exclude",
+            };
+            var operands: std.ArrayList([]const u8) = .empty;
+            defer operands.deinit(ctx.a);
+            var i: usize = 0;
+            while (i < args.len) : (i += 1) {
+                const arg = args[i];
+                if (std.mem.eql(u8, arg, "--as")) {
+                    i += 1;
+                    if (i == args.len) return error.Usage;
+                    parsed.as = args[i];
+                } else if (std.mem.eql(u8, arg, "--force")) {
+                    parsed.force = true;
+                } else if (std.mem.eql(u8, arg, "--mkdir")) {
+                    parsed.mkdir = true;
+                } else if (std.mem.eql(u8, arg, "--no-exclude")) {
+                    parsed.no_exclude = true;
+                } else if (std.mem.startsWith(u8, arg, "--")) {
+                    return error.Usage;
+                } else try operands.append(ctx.a, arg);
+            }
+            if (operands.items.len < 2) return error.Usage;
+            break :blk try ugarit.app.link(ctx, operands.items[0], operands.items[1..], parsed);
+        },
+        .unlink => |options| blk: {
+            var skill = options.skill;
+            var paths: std.ArrayList([]const u8) = .empty;
+            defer paths.deinit(ctx.a);
+            var i: usize = 0;
+            while (i < args.len) : (i += 1) {
+                const arg = args[i];
+                if (std.mem.eql(u8, arg, "--skill")) {
+                    i += 1;
+                    if (i == args.len) return error.Usage;
+                    skill = args[i];
+                } else if (std.mem.startsWith(u8, arg, "--")) {
+                    return error.Usage;
+                } else try paths.append(ctx.a, arg);
+            }
+            break :blk try ugarit.app.unlink(ctx, paths.items, skill);
+        },
+        .list => |options| blk: {
+            var parsed = ugarit.app.ListOptions{ .source = options.source, .links = options.links };
+            var query: ?[]const u8 = null;
+            var i: usize = 0;
+            while (i < args.len) : (i += 1) {
+                const arg = args[i];
+                if (std.mem.eql(u8, arg, "--source")) {
+                    i += 1;
+                    if (i == args.len) return error.Usage;
+                    parsed.source = args[i];
+                } else if (std.mem.eql(u8, arg, "--links")) {
+                    parsed.links = true;
+                } else if (std.mem.startsWith(u8, arg, "--")) {
+                    return error.Usage;
+                } else if (query == null) {
+                    query = arg;
+                } else return error.Usage;
+            }
+            try ugarit.app.list(ctx, query, .{
+                .source = parsed.source,
+                .links = parsed.links,
+            });
+            break :blk true;
+        },
+    };
+}
+
+fn report(writer: *std.Io.Writer, err: anyerror) !void {
+    try writer.print("ugarit: {s}", .{ugarit.app.diagnosticMessage(ugarit.app.diagnostic(err))});
+    if (err == error.Git and ugarit.git.lastMessage().len != 0) {
+        try writer.writeAll(": ");
+        try ugarit.config.redact(writer, ugarit.git.lastMessage());
+    }
+    try writer.writeAll("\n");
 }

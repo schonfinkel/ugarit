@@ -1,11 +1,14 @@
 //! Path resolution, tilde expansion and the config-dir lock.
-//! Invariants: I8 (paths stored in the registry are absolute, canonical and
-//! `..`-free — upheld by `canonicalDest`), plus the local invariants
-//! PL1 (`expandTilde` is a pure function of `(home, input)`; it only expands a
-//! leading `~` or `~/`, and rejects `~user`), and PL2 (`canonicalDest` is
-//! idempotent and resolves symlinks, so `canon(canon(p)) == canon(p)`).
+//! Invariants (see `src/test/INVARIANTS.md`):
+//! - Soundness: paths stored in the registry are absolute, canonical and
+//!   `..`-free — upheld by `canonicalDest`.
+//! - Tilde purity (local): `expandTilde` is a pure function of `(home, input)`;
+//!   it only expands a leading `~` or `~/`, and rejects `~user`.
+//! - Canonical-destination idempotence (local): `canonicalDest` is idempotent
+//!   and resolves symlinks, so `canon(canon(p)) == canon(p)`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Paths = struct {
     root: []const u8,
@@ -27,15 +30,20 @@ pub const Paths = struct {
             try std.fs.path.join(a, &.{ h, ".config", "ugarit" })
         else
             return error.NoHomeDirectory;
+        errdefer a.free(root);
         if (!std.fs.path.isAbsolute(root)) {
-            a.free(root);
             return error.ConfigDirNotAbsolute;
         }
+        const config_path = try std.fs.path.join(a, &.{ root, "config.json" });
+        errdefer a.free(config_path);
+        const sources = try std.fs.path.join(a, &.{ root, "sources" });
+        errdefer a.free(sources);
+        const links = try std.fs.path.join(a, &.{ root, "links.json" });
         return .{
             .root = root,
-            .config = try std.fs.path.join(a, &.{ root, "config.json" }),
-            .sources = try std.fs.path.join(a, &.{ root, "sources" }),
-            .links = try std.fs.path.join(a, &.{ root, "links.json" }),
+            .config = config_path,
+            .sources = sources,
+            .links = links,
         };
     }
 
@@ -53,7 +61,7 @@ pub const TildeError = error{
     OutOfMemory,
 };
 
-/// Expands a leading `~` or `~/` only; `~user` is rejected (PL1).
+/// Expands a leading `~` or `~/` only; `~user` is rejected (tilde purity).
 pub fn expandTilde(a: std.mem.Allocator, home: ?[]const u8, p: []const u8) TildeError![]u8 {
     if (p.len == 0 or p[0] != '~') return a.dupe(u8, p);
     if (p.len > 1 and p[1] != '/') return error.UnsupportedTildeUser;
@@ -61,7 +69,8 @@ pub fn expandTilde(a: std.mem.Allocator, home: ?[]const u8, p: []const u8) Tilde
     return std.mem.concat(a, u8, &.{ h, p[1..] });
 }
 
-/// Resolves a user-given destination to a canonical absolute path (PL2, I8).
+/// Resolves a user-given destination to a canonical absolute path
+/// (canonical-destination idempotence, soundness).
 /// The dir must exist unless `mkdir` is set, in which case it is created.
 pub fn canonicalDest(
     a: std.mem.Allocator,
@@ -69,6 +78,61 @@ pub fn canonicalDest(
     home: ?[]const u8,
     raw: []const u8,
     mkdir: bool,
+) ![]u8 {
+    const result = try canonicalDestPath(a, io, home, raw);
+    errdefer a.free(result);
+    if (mkdir) try std.Io.Dir.cwd().createDirPath(io, result);
+    var dir = try std.Io.Dir.openDirAbsolute(io, result, .{});
+    dir.close(io);
+    return result;
+}
+
+/// Resolves existing ancestors and normalizes a destination without creating
+/// it. The final path may be absent; the returned path is owned by `a`.
+pub fn canonicalDestPath(
+    a: std.mem.Allocator,
+    io: std.Io,
+    home: ?[]const u8,
+    raw: []const u8,
+) ![]u8 {
+    const expanded = try expandTilde(a, home, raw);
+    defer a.free(expanded);
+
+    const abs = if (std.fs.path.isAbsolute(expanded))
+        try std.fs.path.resolve(a, &.{expanded})
+    else blk: {
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd_len = try std.Io.Dir.cwd().realPathFile(io, ".", &cwd_buf);
+        break :blk try std.fs.path.resolve(a, &.{ cwd_buf[0..cwd_len], expanded });
+    };
+    defer a.free(abs);
+    return canonicalAllowMissing(a, io, abs);
+}
+
+fn canonicalAllowMissing(a: std.mem.Allocator, io: std.Io, abs: []const u8) ![]u8 {
+    var dir = std.Io.Dir.openDirAbsolute(io, abs, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            const parent = std.fs.path.dirname(abs) orelse return err;
+            if (std.mem.eql(u8, parent, abs)) return err;
+            const canonical_parent = try canonicalAllowMissing(a, io, parent);
+            defer a.free(canonical_parent);
+            return std.fs.path.join(a, &.{ canonical_parent, std.fs.path.basename(abs) });
+        },
+        else => return err,
+    };
+    defer dir.close(io);
+    var rp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rp_len = try dir.realPath(io, &rp_buf);
+    return a.dupe(u8, rp_buf[0..rp_len]);
+}
+
+/// Canonicalizes a user-provided link path without following the final entry.
+/// The returned path is owned by `a`; the parent must already exist.
+pub fn canonicalLinkPath(
+    a: std.mem.Allocator,
+    io: std.Io,
+    home: ?[]const u8,
+    raw: []const u8,
 ) ![]u8 {
     const expanded = try expandTilde(a, home, raw);
     defer a.free(expanded);
@@ -82,13 +146,11 @@ pub fn canonicalDest(
     };
     defer a.free(abs);
 
-    if (mkdir) try std.Io.Dir.cwd().createDirPath(io, abs);
-
-    var dir = try std.Io.Dir.openDirAbsolute(io, abs, .{});
-    defer dir.close(io);
-    var rp_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const rp_len = try dir.realPath(io, &rp_buf);
-    return a.dupe(u8, rp_buf[0..rp_len]);
+    const parent = std.fs.path.dirname(abs) orelse return error.InvalidLinkPath;
+    const name = std.fs.path.basename(abs);
+    var parent_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const parent_len = try std.Io.Dir.realPathFileAbsolute(io, parent, &parent_buf);
+    return std.fs.path.join(a, &.{ parent_buf[0..parent_len], name });
 }
 
 /// True when `path` equals `base` or lies directly or indirectly under it.
@@ -108,6 +170,25 @@ pub fn lock(io: std.Io, root: std.Io.Dir) !std.Io.File {
         error.WouldBlock => error.AnotherUgaritRunning,
         else => e,
     };
+}
+
+/// Refuses `sudo ugarit` when root inherited another user's HOME. This avoids
+/// creating root-owned files in that user's config and projects (sudo-as-root hazard).
+pub fn refuseRootForUser(io: std.Io, home: ?[]const u8) !void {
+    if (builtin.os.tag != .linux or std.c.geteuid() != 0) return;
+    const path = home orelse return;
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
+    defer dir.close(io);
+    var stat = std.mem.zeroes(std.os.linux.Statx);
+    const rc = std.os.linux.statx(
+        @intCast(dir.handle),
+        "",
+        std.os.linux.AT.EMPTY_PATH,
+        std.os.linux.STATX.BASIC_STATS,
+        &stat,
+    );
+    if (std.posix.errno(rc) != .SUCCESS) return error.RootOwnershipCheckFailed;
+    if (stat.uid != 0) return error.RunningAsRootForUser;
 }
 
 test "resolve precedence (c: un-generatable, hand-built environment)" {
@@ -174,6 +255,29 @@ test "canonicalDest resolves relative paths against cwd (c: no cwd sandbox)" {
     const root_len = try t.dir.realPath(io, &root_buf);
     const expected = try std.fmt.allocPrint(a, "{s}/nested", .{root_buf[0..root_len]});
     defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, got);
+}
+
+test "canonicalLinkPath resolves its parent but not the final symlink" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+
+    try t.dir.createDirPath(io, "real/parent");
+    try t.dir.createDirPath(io, "target");
+    try t.dir.symLink(io, "real", "parent-alias", .{ .is_directory = true });
+    try t.dir.symLink(io, "target", "real/parent/link", .{ .is_directory = true });
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try t.dir.realPath(io, &root_buf);
+    const raw = try std.fs.path.join(a, &.{ root_buf[0..root_len], "parent-alias/parent/link" });
+    defer a.free(raw);
+    const got = try canonicalLinkPath(a, io, null, raw);
+    defer a.free(got);
+    const expected = try std.fs.path.join(a, &.{ root_buf[0..root_len], "real/parent/link" });
+    defer a.free(expected);
+
     try std.testing.expectEqualStrings(expected, got);
 }
 

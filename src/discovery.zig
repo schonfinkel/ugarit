@@ -1,17 +1,17 @@
 //! Skill discovery: turns the cloned trees under `sources/` into a lookup
 //! index.
 //!
-//! Invariants:
-//! - **I15 (determinism and confinement):** the index is a pure, sorted
+//! Invariants (see `src/test/INVARIANTS.md`):
+//! - **Discovery determinism and confinement:** the index is a pure, sorted
 //!   function of the tree. No `abs_path` leaves its source root and no result
 //!   path traverses a symlink (symlink entries are warned about and skipped,
 //!   and directories are opened with `follow_symlinks = false`).
-//! - **I4's discovery half:** a skill is a real directory containing a
-//!   regular `SKILL.md`; a `SKILL.md` that is itself a dir or symlink never
+//! - **Confinement's discovery half:** a skill is a real directory containing
+//!   a regular `SKILL.md`; a `SKILL.md` that is itself a dir or symlink never
 //!   makes a skill.
-//! - **D1 (descent cap):** discovery never descends into a skill directory
+//! - **Descent cap (local):** discovery never descends into a skill directory
 //!   and never past `max_depth` levels below the source root.
-//! - **D2 (case-insensitive names):** bare-name lookup folds case (edge
+//! - **Case-insensitive names (local):** bare-name lookup folds case (edge
 //!   case 29); `source/rel_path` queries are exact and case-sensitive.
 //! - **No hidden borrows:** the index owns every string it returns; `deinit`
 //!   frees them all.
@@ -41,7 +41,7 @@ pub const Index = struct {
     warnings: [][]const u8,
 
     /// Resolves `"skill"`, `"source/skill"` or `"source/path/to/skill"`
-    /// (D2). Ambiguity is only possible for bare names.
+    /// (case-insensitive names). Ambiguity is only possible for bare names.
     pub fn lookup(self: Index, query: []const u8) Lookup {
         if (std.mem.indexOfScalar(u8, query, '/') != null) {
             for (self.skills) |s| {
@@ -85,7 +85,8 @@ pub const Index = struct {
     }
 };
 
-/// Scans every configured source under `sources_dir` (I15).
+/// Scans every configured source under `sources_dir` (discovery determinism
+/// and confinement).
 pub fn scan(a: std.mem.Allocator, io: std.Io, sources_dir: std.Io.Dir, cfg: config.Config) !Index {
     var rp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const sources_real_len = try sources_dir.realPath(io, &rp_buf);
@@ -124,7 +125,7 @@ pub fn scan(a: std.mem.Allocator, io: std.Io, sources_dir: std.Io.Dir, cfg: conf
 
     const owned = try skills.toOwnedSlice(a);
     std.mem.sort(Skill, owned, {}, skillLessThan);
-    // I15: confinement holds by construction; assert it in safety-checked builds.
+    // Discovery confinement holds by construction; assert it in safety-checked builds.
     for (owned) |s| std.debug.assert(paths.isUnder(s.abs_path, sources_real));
     return .{
         .skills = owned,
@@ -162,7 +163,7 @@ fn walk(
         else
             try std.fs.path.join(a, &.{ rel, entry.name });
         defer a.free(child_rel);
-        if (try isRegularFile(io, sub, "SKILL.md")) { // a skill: no descent below it (D1)
+        if (try isRegularFile(io, sub, "SKILL.md")) { // a skill: no descent below it (descent cap)
             config.validateName(entry.name) catch {
                 try warn(a, warnings, "invalid skill name {s}/{s}", .{ source, child_rel });
                 continue;
@@ -227,7 +228,8 @@ fn warn(
 }
 
 /// Sort key: (lowercase name, name, source, rel_path) — keeps case-variants
-/// adjacent so `lookup` can hand out a contiguous ambiguous slice (I15, D2).
+/// adjacent so `lookup` can hand out a contiguous ambiguous slice (discovery
+/// determinism, case-insensitive names).
 fn skillLessThan(_: void, x: Skill, y: Skill) bool {
     var lx: [129]u8 = undefined;
     var ly: [129]u8 = undefined;
@@ -257,7 +259,7 @@ fn asciiLowerInto(buf: []u8, s: []const u8) []const u8 {
     return buf[0..n];
 }
 
-test "lookup query forms (b: illustrative table — I15, D2)" {
+test "lookup query forms (b: illustrative table)" {
     const a = std.testing.allocator;
     // Index owns every string, so the literals are duped into it.
     const raw = [_]Skill{
@@ -296,4 +298,32 @@ test "lookup query forms (b: illustrative table — I15, D2)" {
     try std.testing.expect(idx.lookup("rust") == .found);
     try std.testing.expect(idx.lookup("ghost") == .missing);
     try std.testing.expect(idx.lookup("one/zig") == .missing); // exact path only
+}
+
+const ScanOomContext = struct { io: std.Io, sources: std.Io.Dir };
+
+fn scanAllocationFailures(a: std.mem.Allocator, context: ScanOomContext) !void {
+    var idx = try scan(a, context.io, context.sources, .{ .sources = &.{.{
+        .name = "central",
+        .url = "/unused",
+    }} });
+    defer idx.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), idx.skills.len);
+}
+
+test "scan releases partial results under every OOM (a: exhaustive allocation failures)" {
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    try t.dir.createDirPath(io, "central/zig");
+    try t.dir.createDirPath(io, "central/rust");
+    try t.dir.writeFile(io, .{ .sub_path = "central/zig/SKILL.md", .data = "z\n" });
+    try t.dir.writeFile(io, .{ .sub_path = "central/rust/SKILL.md", .data = "r\n" });
+    var sources = try t.dir.openDir(io, ".", .{ .iterate = true });
+    defer sources.close(io);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        scanAllocationFailures,
+        .{ScanOomContext{ .io = io, .sources = sources }},
+    );
 }

@@ -1,12 +1,12 @@
 //! libgit2 wrapper — the only file in ugarit that talks to C.
 //!
-//! Invariants:
-//! - **I11 (no lost work):** `sync` never changes a source's worktree or HEAD
-//!   unless the worktree is clean and the update is a fast-forward. Dirty or
-//!   diverged sources come out byte-for-byte unchanged (asserted by P10).
-//! - **No half clones (I3-adjacent):** `clone` lands in a `.tmp-*` dir beside
-//!   `sources/` and is renamed into place only on success, so an interrupted
-//!   clone never leaves a broken `sources/<name>`.
+//! Invariants (see `src/test/INVARIANTS.md`):
+//! - **No lost work:** `sync` never changes a source's worktree or HEAD unless
+//!   the worktree is clean and the update is a fast-forward. Dirty or diverged
+//!   sources come out byte-for-byte unchanged (asserted by the sync property).
+//! - **No half clones:** `clone` lands in a `.tmp-*` dir beside `sources/` and
+//!   is renamed into place only on success, so an interrupted clone never
+//!   leaves a broken `sources/<name>` (atomic visibility, adjacently).
 //! - **Auth loops terminate:** at most 3 credential attempts per operation.
 //! - **Boundary:** every libgit2 failure is translated into `Error` here; no
 //!   `[*c]` type or raw libgit2 handle escapes this file.
@@ -14,6 +14,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("git2");
+const config = @import("config.zig");
 
 pub const Error = error{
     Git,
@@ -56,7 +57,7 @@ fn check(rc: c_int) Error!void {
     return error.Git;
 }
 
-// --- fault injection (P11): compiled out of release builds -------------------
+// --- fault injection (source-add clone failure): compiled out of release builds
 
 pub const FaultPoint = enum { after_clone };
 
@@ -85,7 +86,8 @@ extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
 /// Honours `SSL_CERT_FILE` / `NIX_SSL_CERT_FILE` (nix's libgit2 links OpenSSL
 /// and does not read the env by itself). Upholds edge case 23.
 pub fn init(env: ?*const std.process.Environ.Map) Error!void {
-    _ = c.git_libgit2_init();
+    try check(c.git_libgit2_init());
+    errdefer _ = c.git_libgit2_shutdown();
     const e = env orelse return;
     if (e.get("SSL_CERT_FILE") orelse e.get("NIX_SSL_CERT_FILE")) |cert_file| {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -173,9 +175,9 @@ fn sshKeyFile(
     return c.git_credential_ssh_key_new(out, user, pub_z, priv_z, null);
 }
 
-fn fetchOpts(st: *CredState) c.git_fetch_options {
+fn fetchOpts(st: *CredState) Error!c.git_fetch_options {
     var fo: c.git_fetch_options = undefined;
-    _ = c.git_fetch_options_init(&fo, c.GIT_FETCH_OPTIONS_VERSION);
+    try check(c.git_fetch_options_init(&fo, c.GIT_FETCH_OPTIONS_VERSION));
     fo.callbacks.credentials = credCb;
     fo.callbacks.payload = st;
     // the field is literally named `type` in the C header
@@ -193,8 +195,8 @@ fn absZ(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, sub: []const u8) Erro
         return error.OutOfMemory;
 }
 
-/// Clones `url` into `sources/<name>` (branch `ref` only for now; tags and
-/// raw SHAs arrive with `checkoutRef` in a later step).
+/// Clones `url` into `sources/<name>`. A branch `ref` becomes a local branch
+/// tracking `origin`; tags and other commit-ish refs produce a detached HEAD.
 /// Upholds the no-half-clone invariant: the clone lands in a `.tmp-*` dir
 /// beside `sources/` and is renamed into place only on success, so an
 /// interrupted clone never leaves a broken `sources/<name>`.
@@ -220,10 +222,8 @@ pub fn clone(
 
     var st: CredState = .{ .env = env };
     var co: c.git_clone_options = undefined;
-    _ = c.git_clone_options_init(&co, c.GIT_CLONE_OPTIONS_VERSION);
-    co.fetch_opts = fetchOpts(&st);
-    if (ref) |r| co.checkout_branch = r.ptr;
-
+    try check(c.git_clone_options_init(&co, c.GIT_CLONE_OPTIONS_VERSION));
+    co.fetch_opts = try fetchOpts(&st);
     const tmp_z = try absZ(a, io, sources, tmp);
     defer a.free(tmp_z);
 
@@ -231,7 +231,9 @@ pub fn clone(
     try check(c.git_clone(&repo, url.ptr, tmp_z.ptr, &co));
     defer c.git_repository_free(repo);
 
-    try failAt(.after_clone); // test-only interruption point (P11)
+    if (ref) |r| try checkoutRef(a, repo, r);
+
+    try failAt(.after_clone); // test-only interruption point (source-add clone failure)
 
     sources.rename(tmp, sources, name, io) catch |e| switch (e) {
         error.DirNotEmpty => return error.SourceExists,
@@ -242,9 +244,72 @@ pub fn clone(
     };
 }
 
+/// Checks out a remote branch as a tracking local branch when `ref` names one.
+/// Otherwise resolves `ref` as a commit-ish and leaves HEAD detached.
+fn checkoutRef(a: std.mem.Allocator, repo: ?*c.git_repository, ref: [:0]const u8) Error!void {
+    var branch_name: []const u8 = ref;
+    if (std.mem.startsWith(u8, branch_name, "refs/heads/")) {
+        branch_name = branch_name["refs/heads/".len..];
+    } else if (std.mem.startsWith(u8, branch_name, "refs/remotes/origin/")) {
+        branch_name = branch_name["refs/remotes/origin/".len..];
+    } else if (std.mem.startsWith(u8, branch_name, "origin/")) {
+        branch_name = branch_name["origin/".len..];
+    }
+
+    const branch_z = std.fmt.allocPrintSentinel(a, "{s}", .{branch_name}, 0) catch
+        return error.OutOfMemory;
+    defer a.free(branch_z);
+    const upstream_z = std.fmt.allocPrintSentinel(a, "origin/{s}", .{branch_name}, 0) catch
+        return error.OutOfMemory;
+    defer a.free(upstream_z);
+
+    var remote: ?*c.git_reference = null;
+    const remote_rc = c.git_branch_lookup(&remote, repo, upstream_z.ptr, c.GIT_BRANCH_REMOTE);
+    if (remote_rc == 0) {
+        defer c.git_reference_free(remote);
+        const target = c.git_reference_target(remote) orelse return error.Git;
+        var commit: ?*c.git_commit = null;
+        try check(c.git_commit_lookup(&commit, repo, target));
+        defer c.git_commit_free(commit);
+
+        var local: ?*c.git_reference = null;
+        const local_rc = c.git_branch_lookup(&local, repo, branch_z.ptr, c.GIT_BRANCH_LOCAL);
+        if (local_rc == c.GIT_ENOTFOUND) {
+            try check(c.git_branch_create(&local, repo, branch_z.ptr, commit, 0));
+        } else {
+            try check(local_rc);
+        }
+        defer c.git_reference_free(local);
+        try check(c.git_branch_set_upstream(local, upstream_z.ptr));
+
+        var opts: c.git_checkout_options = undefined;
+        try check(c.git_checkout_options_init(&opts, c.GIT_CHECKOUT_OPTIONS_VERSION));
+        opts.checkout_strategy = @intCast(c.GIT_CHECKOUT_SAFE);
+        try check(c.git_checkout_tree(repo, @as(?*const c.git_object, @ptrCast(commit)), &opts));
+        const local_ref = c.git_reference_name(local) orelse return error.Git;
+        try check(c.git_repository_set_head(repo, local_ref));
+        return;
+    }
+    if (remote_rc != c.GIT_ENOTFOUND) try check(remote_rc);
+
+    var object: ?*c.git_object = null;
+    try check(c.git_revparse_single(&object, repo, ref.ptr));
+    defer c.git_object_free(object);
+    var commit: ?*c.git_object = null;
+    try check(c.git_object_peel(&commit, object, c.GIT_OBJECT_COMMIT));
+    defer c.git_object_free(commit);
+
+    var opts: c.git_checkout_options = undefined;
+    try check(c.git_checkout_options_init(&opts, c.GIT_CHECKOUT_OPTIONS_VERSION));
+    opts.checkout_strategy = @intCast(c.GIT_CHECKOUT_SAFE);
+    try check(c.git_checkout_tree(repo, commit, &opts));
+    const oid = c.git_object_id(commit) orelse return error.Git;
+    try check(c.git_repository_set_head_detached(repo, oid));
+}
+
 /// Fetches origin and fast-forwards only. Never touches a dirty or diverged
-/// worktree (upholds **I11**). A missing `@{upstream}` counts as `up_to_date`
-/// (edge case 21: empty upstream repo). Detached HEADs are `pinned`.
+/// worktree (upholds no-lost-work). A missing `@{upstream}` counts as
+/// `up_to_date` (edge case 21: empty upstream repo). Detached HEADs are `pinned`.
 pub fn sync(
     dir_z: [:0]const u8,
     expected_url: []const u8,
@@ -259,11 +324,13 @@ pub fn sync(
     defer c.git_remote_free(remote);
     const current = c.git_remote_url(remote);
     if (current == null) return error.RemoteMismatch;
-    if (!std.mem.eql(u8, std.mem.span(current), expected_url)) return error.RemoteMismatch;
-    if (c.git_repository_head_detached(repo) == 1) return .pinned;
+    if (!config.sameUrl(std.mem.span(current), expected_url)) return error.RemoteMismatch;
+    const detached = c.git_repository_head_detached(repo);
+    try check(detached);
+    if (detached == 1) return .pinned;
     if (try isDirty(repo)) return error.DirtyWorktree;
 
-    var fo = fetchOpts(st);
+    var fo = try fetchOpts(st);
     try check(c.git_remote_fetch(remote, null, &fo, null));
 
     // Upstream: normally `@{upstream}`. A clone of an empty origin carries no
@@ -279,7 +346,9 @@ pub fn sync(
     }
     defer c.git_annotated_commit_free(upstream);
 
-    if (c.git_repository_head_unborn(repo) == 1) {
+    const head_unborn = c.git_repository_head_unborn(repo);
+    try check(head_unborn);
+    if (head_unborn == 1) {
         try fastForward(repo, c.git_annotated_commit_id(upstream));
         return .fast_forwarded;
     }
@@ -328,7 +397,7 @@ fn fastForward(repo: ?*c.git_repository, target: [*c]const c.git_oid) Error!void
     defer c.git_tree_free(tree);
 
     var co: c.git_checkout_options = undefined;
-    _ = c.git_checkout_options_init(&co, c.GIT_CHECKOUT_OPTIONS_VERSION);
+    try check(c.git_checkout_options_init(&co, c.GIT_CHECKOUT_OPTIONS_VERSION));
     co.checkout_strategy = @intCast(c.GIT_CHECKOUT_SAFE);
     try check(c.git_checkout_tree(repo, @as(?*const c.git_object, @ptrCast(tree)), &co));
 
@@ -358,7 +427,7 @@ fn fastForward(repo: ?*c.git_repository, target: [*c]const c.git_oid) Error!void
 /// paths (e.g. our `info/exclude` lines) do not.
 fn isDirty(repo: ?*c.git_repository) Error!bool {
     var opts: c.git_status_options = undefined;
-    _ = c.git_status_options_init(&opts, c.GIT_STATUS_OPTIONS_VERSION);
+    try check(c.git_status_options_init(&opts, c.GIT_STATUS_OPTIONS_VERSION));
     opts.flags = @intCast(c.GIT_STATUS_OPT_INCLUDE_UNTRACKED |
         c.GIT_STATUS_OPT_RECURSE_UNTRACKED_DIRS);
     var list: ?*c.git_status_list = null;
@@ -469,8 +538,8 @@ pub fn isPathIgnored(repo_dir: [:0]const u8, rel: []const u8) Error!bool {
 pub const fixtures = struct {
     /// libgit2 requires init before use; refcounted guard.
     pub const Libgit2 = struct {
-        pub fn init() Libgit2 {
-            _ = c.git_libgit2_init();
+        pub fn init() Error!Libgit2 {
+            try check(c.git_libgit2_init());
             return .{};
         }
         pub fn deinit(_: Libgit2) void {
@@ -508,7 +577,7 @@ pub const fixtures = struct {
             else => return error.Git,
         };
         var opts: c.git_repository_init_options = undefined;
-        _ = c.git_repository_init_options_init(&opts, c.GIT_REPOSITORY_INIT_OPTIONS_VERSION);
+        try check(c.git_repository_init_options_init(&opts, c.GIT_REPOSITORY_INIT_OPTIONS_VERSION));
         opts.initial_head = "main";
         var repo: ?*c.git_repository = null;
         try check(c.git_repository_init_ext(&repo, path_z.ptr, &opts));
@@ -595,6 +664,52 @@ pub const fixtures = struct {
         try commitIndex(repo_dir, &.{.{ .path = rel, .add = true }});
     }
 
+    /// Creates a local branch at HEAD and checks it out.
+    pub fn createBranch(repo_dir: [:0]const u8, name: [:0]const u8) Error!void {
+        const repo = try open(repo_dir);
+        defer c.git_repository_free(repo);
+        var oid: c.git_oid = undefined;
+        try check(c.git_reference_name_to_id(&oid, repo, "HEAD"));
+        var head: ?*c.git_commit = null;
+        try check(c.git_commit_lookup(&head, repo, &oid));
+        defer c.git_commit_free(head);
+        var branch: ?*c.git_reference = null;
+        try check(c.git_branch_create(&branch, repo, name.ptr, head, 0));
+        defer c.git_reference_free(branch);
+        const branch_ref = c.git_reference_name(branch) orelse return error.Git;
+        try check(c.git_repository_set_head(repo, branch_ref));
+        var opts: c.git_checkout_options = undefined;
+        try check(c.git_checkout_options_init(&opts, c.GIT_CHECKOUT_OPTIONS_VERSION));
+        opts.checkout_strategy = @intCast(c.GIT_CHECKOUT_FORCE);
+        try check(c.git_checkout_head(repo, &opts));
+    }
+
+    /// Checks out an existing local branch.
+    pub fn checkoutBranch(repo_dir: [:0]const u8, name: [:0]const u8) Error!void {
+        const repo = try open(repo_dir);
+        defer c.git_repository_free(repo);
+        var branch: ?*c.git_reference = null;
+        try check(c.git_branch_lookup(&branch, repo, name.ptr, c.GIT_BRANCH_LOCAL));
+        defer c.git_reference_free(branch);
+        const branch_ref = c.git_reference_name(branch) orelse return error.Git;
+        try check(c.git_repository_set_head(repo, branch_ref));
+        var opts: c.git_checkout_options = undefined;
+        try check(c.git_checkout_options_init(&opts, c.GIT_CHECKOUT_OPTIONS_VERSION));
+        opts.checkout_strategy = @intCast(c.GIT_CHECKOUT_FORCE);
+        try check(c.git_checkout_head(repo, &opts));
+    }
+
+    /// Creates a lightweight tag at HEAD.
+    pub fn tagHead(repo_dir: [:0]const u8, name: [:0]const u8) Error!void {
+        const repo = try open(repo_dir);
+        defer c.git_repository_free(repo);
+        var object: ?*c.git_object = null;
+        try check(c.git_revparse_single(&object, repo, "HEAD"));
+        defer c.git_object_free(object);
+        var oid: c.git_oid = undefined;
+        try check(c.git_tag_create_lightweight(&oid, repo, name.ptr, object, 0));
+    }
+
     /// Moves a tracked file and commits the move (upstream relocation fixture).
     pub fn moveFile(io: std.Io, repo_dir: [:0]const u8, from: []const u8, to: []const u8) Error!void {
         var d = std.Io.Dir.openDirAbsolute(io, repo_dir, .{}) catch return error.Git;
@@ -664,7 +779,7 @@ pub const fixtures = struct {
     }
 
     /// Sorted `(path, content)` of every worktree file, skipping `.git`.
-    /// The oracle half of P10's "unchanged" assertions.
+    /// The oracle half of the sync property's "unchanged" assertions.
     pub fn snapshotWorktree(a: std.mem.Allocator, io: std.Io, dir_abs: []const u8) Error![]FileEntry {
         var list: std.ArrayList(FileEntry) = .empty;
         errdefer {
@@ -716,7 +831,7 @@ pub const fixtures = struct {
 test "clone refuses an existing target and cleans its temp dir (c: filesystem state)" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const lg = fixtures.Libgit2.init();
+    const lg = try fixtures.Libgit2.init();
     defer lg.deinit();
     var t = std.testing.tmpDir(.{});
     defer t.cleanup();
@@ -741,7 +856,92 @@ test "clone refuses an existing target and cleans its temp dir (c: filesystem st
     try std.testing.expectEqual(@as(usize, 1), names);
 }
 
-test "snapshotWorktree skips .git and sorts (c: pins the P10 oracle)" {
+test "clone checks out a branch with tracking" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const lg = try fixtures.Libgit2.init();
+    defer lg.deinit();
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+
+    const origin = try fixtures.initOrigin(a, io, t.dir, "origin");
+    defer a.free(origin);
+    try fixtures.commitFile(io, origin, "base.txt", "base\n");
+    try fixtures.createBranch(origin, "topic");
+    try fixtures.commitFile(io, origin, "topic.txt", "topic\n");
+    const topic_oid = (try fixtures.headOid(origin)).?;
+    try fixtures.checkoutBranch(origin, "main");
+
+    try t.dir.createDirPath(io, "sources");
+    var sources = try t.dir.openDir(io, "sources", .{});
+    defer sources.close(io);
+    try clone(a, io, sources, null, origin, "branch", "topic");
+    const local = try fixtures.dirZ(a, io, sources, "branch");
+    defer a.free(local);
+    try std.testing.expectEqual(topic_oid, (try fixtures.headOid(local)).?);
+
+    var st: CredState = .{};
+    try std.testing.expectEqual(SyncResult.up_to_date, try sync(local, origin, &st));
+    try fixtures.checkoutBranch(origin, "topic");
+    try fixtures.commitFile(io, origin, "later.txt", "later\n");
+    try std.testing.expectEqual(SyncResult.fast_forwarded, try sync(local, origin, &st));
+    try std.testing.expectEqual((try fixtures.headOid(origin)).?, (try fixtures.headOid(local)).?);
+}
+
+test "clone checks out a tag with detached HEAD" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const lg = try fixtures.Libgit2.init();
+    defer lg.deinit();
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+
+    const origin = try fixtures.initOrigin(a, io, t.dir, "origin");
+    defer a.free(origin);
+    try fixtures.commitFile(io, origin, "version.txt", "v1\n");
+    const tagged_oid = (try fixtures.headOid(origin)).?;
+    try fixtures.tagHead(origin, "v1");
+    try fixtures.commitFile(io, origin, "version.txt", "v2\n");
+
+    try t.dir.createDirPath(io, "sources");
+    var sources = try t.dir.openDir(io, "sources", .{});
+    defer sources.close(io);
+    try clone(a, io, sources, null, origin, "tag", "v1");
+    const local = try fixtures.dirZ(a, io, sources, "tag");
+    defer a.free(local);
+    try std.testing.expectEqual(tagged_oid, (try fixtures.headOid(local)).?);
+    var st: CredState = .{};
+    try std.testing.expectEqual(SyncResult.pinned, try sync(local, origin, &st));
+}
+
+test "clone checks out a raw commit SHA with detached HEAD" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const lg = try fixtures.Libgit2.init();
+    defer lg.deinit();
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+
+    const origin = try fixtures.initOrigin(a, io, t.dir, "origin");
+    defer a.free(origin);
+    try fixtures.commitFile(io, origin, "version.txt", "v1\n");
+    const pinned_oid = (try fixtures.headOid(origin)).?;
+    try fixtures.commitFile(io, origin, "version.txt", "v2\n");
+    var sha_buf: [41]u8 = undefined;
+    const sha = try std.fmt.bufPrintZ(&sha_buf, "{s}", .{pinned_oid});
+
+    try t.dir.createDirPath(io, "sources");
+    var sources = try t.dir.openDir(io, "sources", .{});
+    defer sources.close(io);
+    try clone(a, io, sources, null, origin, "sha", sha);
+    const local = try fixtures.dirZ(a, io, sources, "sha");
+    defer a.free(local);
+    try std.testing.expectEqual(pinned_oid, (try fixtures.headOid(local)).?);
+    var st: CredState = .{};
+    try std.testing.expectEqual(SyncResult.pinned, try sync(local, origin, &st));
+}
+
+test "snapshotWorktree skips .git and sorts (c: pins the sync property oracle)" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     var t = std.testing.tmpDir(.{});

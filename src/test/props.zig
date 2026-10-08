@@ -1,6 +1,7 @@
-//! Property tests for `paths.zig` and `config.zig` (P2–P5 in PLAN.md).
-//! Every property states its claim in the test name; failures print the seed
-//! and the shrunk counterexample (minish).
+//! Property tests for every module. Each property states its claim in a
+//! comment and its test name; failures print the seed and the shrunk
+//! counterexample (minish). The guarantees they exercise are catalogued in
+//! `INVARIANTS.md`.
 
 const std = @import("std");
 const minish = @import("minish");
@@ -13,7 +14,9 @@ const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;
 
 // ---------------------------------------------------------------------------
-// P2/P2b: extractRepoName (I14)
+// Property: `extractRepoName` recovers the name from every URL form, and
+// near-miss or garbage URLs yield a valid name or an error, never a crash
+// (invariant: `extractRepoName` totality).
 // ---------------------------------------------------------------------------
 
 fn urlNameRoundTrip(name: []const u8) !void {
@@ -31,7 +34,7 @@ fn urlNameRoundTrip(name: []const u8) !void {
     }
 }
 
-test "P2: extractRepoName recovers the name from every URL form" {
+test "extractRepoName recovers the name from every URL form" {
     try minish.check(
         std.testing.allocator,
         gen.string(.{ .min_len = 1, .max_len = 24, .charset = .alphanumeric }),
@@ -97,7 +100,7 @@ fn urlRobustness(m: UrlMutation) !void {
     }
 }
 
-test "P2b: extractRepoName never crashes and yields valid-or-error on near-miss URLs" {
+test "extractRepoName never crashes and yields valid-or-error on near-miss URLs" {
     const url_mut_gen = gen.structure(UrlMutation, .{
         .name = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .alphanumeric }),
         .kind = gen.intRange(u8, 0, 6),
@@ -111,7 +114,8 @@ test "P2b: extractRepoName never crashes and yields valid-or-error on near-miss 
 }
 
 // ---------------------------------------------------------------------------
-// P3/P3b: validateName (I14)
+// Property: `validateName` agrees with an independently written name spec and
+// classifies boundary cases correctly (invariant: `extractRepoName` totality).
 // ---------------------------------------------------------------------------
 
 fn specValidName(n: []const u8) bool {
@@ -130,7 +134,7 @@ fn validateNameMatchesSpec(n: []const u8) !void {
     try expectEqual(specValidName(n), got_valid);
 }
 
-test "P3: validateName agrees with an independently written name spec" {
+test "validateName agrees with an independently written name spec" {
     try minish.check(
         std.testing.allocator,
         gen.string(.{ .min_len = 0, .max_len = 64, .charset = .printable }),
@@ -165,7 +169,7 @@ fn boundaryNames(i: usize) !void {
     try expectEqual(c.valid, got_valid);
 }
 
-test "P3b: validateName boundary classes" {
+test "validateName boundary classes" {
     try minish.check(
         std.testing.allocator,
         gen.intRange(usize, 0, 13),
@@ -175,7 +179,9 @@ test "P3b: validateName boundary classes" {
 }
 
 // ---------------------------------------------------------------------------
-// P4: config save/load (I12, I13)
+// Property: config save→load is the identity; truncated or garbage bytes yield
+// an error, never a partial config (invariants: failure atomicity, config
+// well-formedness).
 // ---------------------------------------------------------------------------
 
 const SourceSeed = struct {
@@ -240,7 +246,7 @@ fn configRoundTrip(seed: ConfigSeed) !void {
     try expectConfigEqual(loaded.value, again.value);
 }
 
-test "P4: config save→load is the identity" {
+test "config save→load is the identity" {
     try minish.check(std.testing.allocator, config_seed_gen, configRoundTrip, .{
         .seed = 0xc04f16,
         .num_runs = 200,
@@ -258,7 +264,7 @@ fn configRejectsBadBytes(bytes: []const u8) !void {
     try expectEqual(@as(u32, 1), loaded.value.version);
 }
 
-test "P4: config load of arbitrary bytes is valid-v1-or-error" {
+test "config load of arbitrary bytes is valid-v1-or-error" {
     try minish.check(
         std.testing.allocator,
         gen.string(.{ .min_len = 0, .max_len = 64, .charset = .printable }),
@@ -293,7 +299,7 @@ fn configSpecificRejections(i: usize) !void {
     }
 }
 
-test "P4: config load rejects malformed and invalid configs with the documented error" {
+test "config load rejects malformed and invalid configs with the documented error" {
     try minish.check(
         std.testing.allocator,
         gen.intRange(usize, 0, 4),
@@ -303,7 +309,9 @@ test "P4: config load rejects malformed and invalid configs with the documented 
 }
 
 // ---------------------------------------------------------------------------
-// P5: expandTilde and canonicalDest (PL1, PL2, I8)
+// Property: `expandTilde` handles every tilde form exactly, and `canonicalDest`
+// is absolute, `..`-free, symlink-resolving and idempotent (invariants: tilde
+// purity, canonical-destination idempotence, soundness).
 // ---------------------------------------------------------------------------
 
 const TildeSeed = struct {
@@ -352,7 +360,7 @@ fn expandTildeForms(s: TildeSeed) !void {
     }
 }
 
-test "P5: expandTilde handles all tilde forms exactly" {
+test "expandTilde handles all tilde forms exactly" {
     const tilde_gen = gen.structure(TildeSeed, .{
         .home = gen.string(.{ .min_len = 1, .max_len = 16, .charset = .printable }),
         .x = gen.string(.{ .min_len = 1, .max_len = 8, .charset = .alphanumeric }),
@@ -434,7 +442,7 @@ fn canonicalDestForms(s: CanonSeed) !void {
     try expectEqualStrings(got, again);
 }
 
-test "P5: canonicalDest is canonical, idempotent and symlink-resolving" {
+test "canonicalDest is canonical, idempotent and symlink-resolving" {
     const canon_gen = gen.structure(CanonSeed, .{
         .names = gen.list([]const u8, gen.string(.{
             .min_len = 1,
@@ -451,7 +459,9 @@ test "P5: canonicalDest is canonical, idempotent and symlink-resolving" {
 }
 
 // ---------------------------------------------------------------------------
-// P10: git.sync respects the local state (I11)
+// Property: `sync` on random local states changes only a clean, fast-forward
+// worktree; dirty, diverged, detached and mismatched states are byte-for-byte
+// unchanged (invariant: no lost work).
 // ---------------------------------------------------------------------------
 
 const git = ugarit.git;
@@ -468,7 +478,7 @@ const LocalState = struct {
 
 const Outcome = union(enum) { res: git.SyncResult, err: git.Error };
 
-/// Oracle written from the spec (PLAN.md I11 + edge cases 19-21), not from
+/// Oracle written from the spec (no-lost-work + edge cases 19-21), not from
 /// the implementation.
 fn expectedOutcome(s: LocalState) Outcome {
     if (s.url_mismatch) return .{ .err = error.RemoteMismatch };
@@ -491,7 +501,7 @@ fn filesEql(x: []fx.FileEntry, y: []fx.FileEntry) bool {
 fn syncRespectsLocalState(s: LocalState) !void {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const lg = fx.Libgit2.init();
+    const lg = try fx.Libgit2.init();
     defer lg.deinit();
     var t = std.testing.tmpDir(.{});
     defer t.cleanup();
@@ -582,7 +592,7 @@ fn syncRespectsLocalState(s: LocalState) !void {
     }
 }
 
-test "P10: sync on random local states — only clean+fast-forward changes anything" {
+test "sync on random local states — only clean+fast-forward changes anything" {
     const local_state_gen = gen.structure(LocalState, .{
         .ahead = gen.intRange(u8, 0, 2),
         .behind = gen.intRange(u8, 0, 3),
@@ -598,7 +608,8 @@ test "P10: sync on random local states — only clean+fast-forward changes anyth
 }
 
 // ---------------------------------------------------------------------------
-// P6: discovery on random trees (I15, I4)
+// Property: discovery on random trees is sorted, confined, symlink-free and
+// case-folded (invariants: discovery determinism and confinement, confinement).
 // ---------------------------------------------------------------------------
 
 const discovery = ugarit.discovery;
@@ -657,7 +668,7 @@ fn scanMatchesOracle(spec: TreeSpec) !void {
     var t = std.testing.tmpDir(.{});
     defer t.cleanup();
 
-    // symlink bait outside sources/ (I15: no traversal)
+    // symlink bait outside sources/ (discovery determinism: no traversal)
     try t.dir.createDirPath(io, "outside/bait");
     try t.dir.writeFile(io, .{ .sub_path = "outside/bait/SKILL.md", .data = "bait\n" });
     var outside_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -761,7 +772,7 @@ fn scanMatchesOracle(spec: TreeSpec) !void {
     var idx = try discovery.scan(a, io, sources, cfg);
     defer idx.deinit(a);
 
-    // I15: sorted, deterministic order
+    // discovery determinism: sorted, deterministic order
     std.mem.sort(ExpSkill, expected.items, {}, expLessThan);
     try expectEqual(expected.items.len, idx.skills.len);
     var sorted_ok = true;
@@ -784,7 +795,8 @@ fn scanMatchesOracle(spec: TreeSpec) !void {
         }
     }
 
-    // I15: confinement — abs paths are under realpath(sources), `..`-free
+    // discovery determinism and confinement: abs paths are under
+    // realpath(sources), `..`-free
     var real_buf: [std.fs.max_path_bytes]u8 = undefined;
     const real_len = try sources.realPath(io, &real_buf);
     const sources_real = real_buf[0..real_len];
@@ -799,7 +811,7 @@ fn scanMatchesOracle(spec: TreeSpec) !void {
         try expectEqualStrings(want_abs, s.abs_path);
     }
 
-    // D2: bare-name lookup is case-insensitive; path queries are exact
+    // case-insensitive names: bare-name lookup is case-insensitive; path queries are exact
     for (expected.items) |e| {
         const q = try std.fmt.allocPrint(a, "{s}/{s}", .{ e.source, e.rel });
         defer a.free(q);
@@ -827,7 +839,7 @@ fn scanMatchesOracle(spec: TreeSpec) !void {
     try std.testing.expect(idx.lookup("ghost/zig") == .missing);
     try std.testing.expect(idx.lookup("skillat5") == .missing);
 
-    // I15: pure function of the tree — a rescan is identical
+    // discovery determinism: pure function of the tree — a rescan is identical
     var again = try discovery.scan(a, io, sources, cfg);
     defer again.deinit(a);
     try expectEqual(idx.skills.len, again.skills.len);
@@ -848,7 +860,9 @@ fn scanMatchesOracle(spec: TreeSpec) !void {
 }
 
 // ---------------------------------------------------------------------------
-// P7: classify × link decision table (I2, I6)
+// Property: `classify` × `link` over every pre-existing entry kind × `force`
+// matches the decision table; real entries survive (invariants: ownership,
+// idempotence).
 // ---------------------------------------------------------------------------
 
 const symlink = ugarit.symlink;
@@ -868,7 +882,7 @@ const LinkExpect = union(enum) {
     err: error{ RealEntryInTheWay, ForeignLinkInTheWay, LinkedFromOtherSource },
 };
 
-/// Oracle straight from PLAN.md edge case 40.
+/// Oracle straight from the decision table (edge case 40).
 fn expectLink(pre: PreState, force: bool) LinkExpect {
     return switch (pre) {
         .absent => .{ .ok = .created },
@@ -1022,7 +1036,7 @@ fn linkDecisionTable(case: LinkCase) !void {
         .ok => |o| try expectEqual(o, try result),
     }
 
-    // I2: real entries survive everything, --force included
+    // ownership: real entries survive everything, --force included
     switch (pre) {
         .real_file => {
             const bytes = try env.dest.readFileAlloc(io, "zig", a, .limited(64));
@@ -1043,7 +1057,7 @@ fn linkDecisionTable(case: LinkCase) !void {
         const n = try env.dest.readLink(io, "zig", &buf);
         try expectEqualStrings(env.skill.abs_path, buf[0..n]);
 
-        // I6: linking again is a no-op
+        // idempotence: linking again is a no-op
         const snap1 = try snapshotDest(a, io, env.dest);
         defer freeDestSnapshot(a, snap1);
         try expectEqual(symlink.LinkOutcome.unchanged, try symlink.link(io, env.dest, "zig", env.skill, env.sources_real, false));
@@ -1051,20 +1065,20 @@ fn linkDecisionTable(case: LinkCase) !void {
         defer freeDestSnapshot(a, snap2);
         try expectEqual(snap1.len, snap2.len);
 
-        // I7: unlink restores absence
+        // inverse: unlink restores absence
         try expectEqual(symlink.UnlinkOutcome.removed, try symlink.unlink(io, env.dest, "zig", env.sources_real));
         const final = try snapshotDest(a, io, env.dest);
         defer freeDestSnapshot(a, final);
         try expectEqual(@as(usize, 0), final.len);
     } else {
-        // no temp left behind (I3)
+        // no temp left behind (atomic visibility)
         const after = try snapshotDest(a, io, env.dest);
         defer freeDestSnapshot(a, after);
         for (after) |e| try std.testing.expect(!std.mem.startsWith(u8, e.name, ".u-"));
     }
 }
 
-test "P7: classify × link decision table — real entries survive, outcomes match" {
+test "classify × link decision table — real entries survive, outcomes match" {
     const link_gen = gen.structure(LinkCase, .{
         .pre = gen.intRange(u8, 0, 6),
         .force = gen.boolean(),
@@ -1076,7 +1090,8 @@ test "P7: classify × link decision table — real entries survive, outcomes mat
 }
 
 // ---------------------------------------------------------------------------
-// P8: interrupted link leaves no trace (I3)
+// Property: a fault after the temp symlink is created leaves the destination
+// byte-identical and no reserved temp behind (invariant: atomic visibility).
 // ---------------------------------------------------------------------------
 
 var fault_at: ?symlink.FaultPoint = null;
@@ -1113,7 +1128,7 @@ fn interruptedLinkIsInvisible(case: FaultCase) !void {
         },
     }
 
-    // dest byte-identical, and no reserved temp remains (I3)
+    // dest byte-identical, and no reserved temp remains (atomic visibility)
     const after = try snapshotDest(a, io, env.dest);
     defer freeDestSnapshot(a, after);
     try expectEqual(before.len, after.len);
@@ -1132,7 +1147,7 @@ fn interruptedLinkIsInvisible(case: FaultCase) !void {
     }
 }
 
-test "P8: fault after temp symlink / before rename — dest unchanged, no temps" {
+test "fault after temp symlink / before rename — dest unchanged, no temps" {
     const fault_gen = gen.structure(FaultCase, .{
         .pre = gen.intRange(u8, 0, 6),
         .force = gen.boolean(),
@@ -1145,7 +1160,9 @@ test "P8: fault after temp symlink / before rename — dest unchanged, no temps"
 }
 
 // ---------------------------------------------------------------------------
-// P9: git-exclude idempotence and confinement (I16, I1)
+// Property: `excludeInEnclosingRepo` called N times appends at most one line
+// and never writes outside `commondir/info/` (invariants: exclude idempotence,
+// no collateral damage).
 // ---------------------------------------------------------------------------
 
 const ExcludeCase = struct { n: u8, scenario: u8 };
@@ -1153,7 +1170,7 @@ const ExcludeCase = struct { n: u8, scenario: u8 };
 fn excludeIsIdempotent(case: ExcludeCase) !void {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const lg = fx.Libgit2.init();
+    const lg = try fx.Libgit2.init();
     defer lg.deinit();
     var t = std.testing.tmpDir(.{});
     defer t.cleanup();
@@ -1192,7 +1209,7 @@ fn excludeIsIdempotent(case: ExcludeCase) !void {
         }
     }
 
-    // exactly one anchored line, only in commondir/info/exclude (I16, I1)
+    // exactly one anchored line, only in commondir/info/exclude (exclude idempotence, no collateral damage)
     var git_dir = try std.Io.Dir.openDirAbsolute(io, proj, .{}); // proj IS the workdir; .git inside
     defer git_dir.close(io);
     var info_dir = git_dir.openDir(io, ".git/info", .{}) catch |e| switch (e) {
@@ -1218,13 +1235,13 @@ fn excludeIsIdempotent(case: ExcludeCase) !void {
     }
     try expectEqual(@as(usize, if (case.scenario == 0) 1 else 0), count);
 
-    // I1: the worktree itself is untouched (info/exclude lives under .git)
+    // no collateral damage: the worktree itself is untouched (info/exclude lives under .git)
     const worktree_after = try fx.snapshotWorktree(a, io, proj);
     defer fx.freeSnapshot(a, worktree_after);
     try std.testing.expect(filesEql(worktree_before, worktree_after));
 }
 
-test "P9: excludeInEnclosingRepo appends at most one line, never writes outside" {
+test "excludeInEnclosingRepo appends at most one line, never writes outside" {
     const exclude_gen = gen.structure(ExcludeCase, .{
         .n = gen.intRange(u8, 1, 5),
         .scenario = gen.intRange(u8, 0, 2),
@@ -1235,7 +1252,7 @@ test "P9: excludeInEnclosingRepo appends at most one line, never writes outside"
     });
 }
 
-test "P6: discovery on random trees — sorted, confined, symlink-free, case-folded" {
+test "discovery on random trees — sorted, confined, symlink-free, case-folded" {
     const tree_gen = gen.structure(TreeSpec, .{
         .root_skill = gen.boolean(),
         .k = gen.array(
@@ -1255,7 +1272,9 @@ test "P6: discovery on random trees — sorted, confined, symlink-free, case-fol
 }
 
 // ---------------------------------------------------------------------------
-// P13: registry load/save round-trip, duplicate collapse, host immunity (I8, H4)
+// Property: registry save→load round-trips; duplicate (host, path) entries
+// collapse to the last; other-host entries are never touched (invariants:
+// soundness, host portability).
 // ---------------------------------------------------------------------------
 
 const Registry = ugarit.Registry;
@@ -1327,7 +1346,7 @@ fn registryRoundTrip(spec: RegSpec) !void {
     defer a.free(second);
     try expectEqualStrings(first, second);
 
-    // mutation on this host never touches other-host entries (H4)
+    // mutation on this host never touches other-host entries (host portability)
     const others_before = try deepDupLinks(a, reg.links);
     defer {
         for (others_before) |l| {
@@ -1398,7 +1417,7 @@ fn registryRoundTrip(spec: RegSpec) !void {
     }
 }
 
-test "P13: registry round-trip, duplicate collapse, other-host immunity" {
+test "registry round-trip, duplicate collapse, other-host immunity" {
     const reg_gen = gen.structure(RegSpec, .{
         .mine = gen.intRange(u8, 0, 7),
         .others = gen.intRange(u8, 0, 7),
@@ -1412,13 +1431,14 @@ test "P13: registry round-trip, duplicate collapse, other-host immunity" {
 }
 
 // ---------------------------------------------------------------------------
-// P12: repair relinks only on a unique same-name match (I10, I4)
+// Property: `repair` relinks only on a unique same-name move and otherwise
+// reports dangling (invariants: repair preserves identity, confinement).
 // ---------------------------------------------------------------------------
 
 fn repairRespectsIdentity(scenario: u8) !void {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    const lg = fx.Libgit2.init();
+    const lg = try fx.Libgit2.init();
     defer lg.deinit();
     var t = std.testing.tmpDir(.{});
     defer t.cleanup();
@@ -1494,7 +1514,7 @@ fn repairRespectsIdentity(scenario: u8) !void {
     var report = try reg.repair(a, io, idx2, "central", "testhost", sources_real);
     defer report.deinit(a);
 
-    // verify each link's end state against the spec (I10)
+    // verify each link's end state against the spec (repair preserves identity)
     switch (scenario) {
         0 => {
             try expectEqual(@as(usize, 2), report.repaired.len);
@@ -1532,11 +1552,143 @@ fn repairRespectsIdentity(scenario: u8) !void {
     }
 }
 
-test "P12: repair relinks on a unique same-name move, else reports dangling" {
+test "repair relinks on a unique same-name move, else reports dangling" {
     try minish.check(
         std.testing.allocator,
         gen.intRange(u8, 0, 2),
         repairRespectsIdentity,
         .{ .seed = 0x12ba, .num_runs = 30 },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Property: generated link, unlink and tamper commands preserve the filesystem
+// and registry invariants after every step (invariants: no collateral damage
+// through repair preserves identity, exit status).
+// ---------------------------------------------------------------------------
+
+const AppFsState = enum { absent, linked, real };
+
+fn appStateMachine(ops: [16]u8) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    try t.dir.createDirPath(io, "managed/sources/central/zig");
+    try t.dir.writeFile(io, .{ .sub_path = "managed/sources/central/zig/SKILL.md", .data = "v1\n" });
+    try t.dir.writeFile(io, .{ .sub_path = "outside", .data = "untouched\n" });
+    for (0..3) |i| {
+        var rel_buf: [32]u8 = undefined;
+        const rel = try std.fmt.bufPrint(&rel_buf, "dest/{d}", .{i});
+        try t.dir.createDirPath(io, rel);
+    }
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try t.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const managed = try std.fs.path.join(a, &.{ root, "managed" });
+    defer a.free(managed);
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", root);
+    var out_buf: [8192]u8 = undefined;
+    var out = std.Io.Writer.fixed(&out_buf);
+    var err_buf: [8192]u8 = undefined;
+    var err = std.Io.Writer.fixed(&err_buf);
+    var ctx = try ugarit.app.Context.init(a, io, &env, managed, &out, &err);
+    defer ctx.deinit();
+    try ctx.cfg.append(.{ .name = "central", .url = "/unused" });
+    try config.save(a, io, ctx.root_dir, ctx.cfg.value);
+
+    var dests: [3][]const u8 = undefined;
+    defer for (dests) |dest| a.free(dest);
+    var link_paths: [3][]const u8 = undefined;
+    defer for (link_paths) |path| a.free(path);
+    for (0..3) |i| {
+        dests[i] = try std.fmt.allocPrint(a, "{s}/dest/{d}", .{ root, i });
+        link_paths[i] = try std.fs.path.join(a, &.{ dests[i], "zig" });
+    }
+    var fs_state = [_]AppFsState{.absent} ** 3;
+    var registered = [_]bool{false} ** 3;
+
+    for (ops) |raw| {
+        const i: usize = raw % 3;
+        switch ((raw / 3) % 5) {
+            0, 4 => {
+                const values = [_][]const u8{dests[i]};
+                const ok = try ugarit.app.link(&ctx, "zig", &values, .{ .no_exclude = true });
+                if (fs_state[i] == .real) {
+                    try std.testing.expect(!ok);
+                } else {
+                    try std.testing.expect(ok);
+                    fs_state[i] = .linked;
+                    registered[i] = true;
+                }
+            },
+            1 => {
+                const values = [_][]const u8{link_paths[i]};
+                const ok = try ugarit.app.unlink(&ctx, &values, null);
+                if (fs_state[i] == .real) {
+                    try std.testing.expect(!ok);
+                } else {
+                    try std.testing.expect(ok);
+                    fs_state[i] = .absent;
+                    registered[i] = false;
+                }
+            },
+            2 => {
+                if (fs_state[i] == .linked) try std.Io.Dir.deleteFileAbsolute(io, link_paths[i]);
+                fs_state[i] = if (fs_state[i] == .real) .real else .absent;
+            },
+            3 => {
+                switch (fs_state[i]) {
+                    .linked => {
+                        try std.Io.Dir.deleteFileAbsolute(io, link_paths[i]);
+                        try std.Io.Dir.createDirAbsolute(io, link_paths[i], .default_dir);
+                    },
+                    .real => {},
+                    .absent => try std.Io.Dir.createDirAbsolute(io, link_paths[i], .default_dir),
+                }
+                fs_state[i] = .real;
+            },
+            else => unreachable,
+        }
+
+        var count: usize = 0;
+        var reg_entry: ?RegLink = null;
+        for (ctx.registry.links) |entry| {
+            if (!std.mem.eql(u8, entry.host, ctx.host)) continue;
+            if (!std.mem.eql(u8, entry.path, link_paths[i])) continue;
+            count += 1;
+            reg_entry = entry;
+        }
+        try expectEqual(@as(usize, if (registered[i]) 1 else 0), count);
+        if (reg_entry) |entry| {
+            const expected: RegState = switch (fs_state[i]) {
+                .linked => .ok,
+                .absent => .missing,
+                .real => .replaced,
+            };
+            try expectEqual(expected, try ugarit.registry.status(io, entry, ctx.sources_real));
+        }
+
+        var dest = try std.Io.Dir.openDirAbsolute(io, dests[i], .{ .iterate = true });
+        defer dest.close(io);
+        var it = dest.iterate();
+        while (try it.next(io)) |entry| {
+            try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".u-"));
+        }
+        const outside = try t.dir.readFileAlloc(io, "outside", a, .limited(64));
+        defer a.free(outside);
+        try expectEqualStrings("untouched\n", outside);
+    }
+}
+
+test "generated link, unlink and tamper commands preserve filesystem and registry invariants" {
+    try minish.check(
+        std.testing.allocator,
+        gen.array(u8, 16, gen.intRange(u8, 0, 14)),
+        appStateMachine,
+        .{ .seed = 0x06a417, .num_runs = 24 },
     );
 }
