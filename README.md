@@ -2,9 +2,7 @@
 
 [![built with nix](https://builtwithnix.org/badge.svg)](https://builtwithnix.org)
 
-Ugarit is a small CLI for discovering skills in Git repositories and linking
-them into the directories used by coding agents. It keeps one managed clone of
-each source, records links per host, and repairs links after upstream moves.
+Ugarit is a small CLI for discovering skills in Git repositories and linking them into the directories used by coding agents. It keeps one managed clone of each source, records links per host, and repairs links after upstream moves.
 
 ## Quick Start
 
@@ -28,7 +26,7 @@ Register a skill repository, inspect its skills, and link one:
 ```sh
 ugarit source-add https://github.com/example/skills.git
 ugarit list
-ugarit link skills/my-skill ~/.claude/skills --mkdir
+ugarit link skills my-skill ~/.claude/skills --mkdir
 ugarit list my-skill --links
 ```
 
@@ -45,33 +43,21 @@ ugarit unlink ~/.claude/skills/my-skill
 ugarit unlink --skill my-skill
 ```
 
-Ugarit will not replace real files or directories. `--force` permits replacing
-another symlink, but never a real entry. Links created inside a Git worktree are
-added to the repository's local `.git/info/exclude` unless `--no-exclude` is
-used; tracked paths are rejected.
+### Properties
+
+- Ugarit will not replace real files or directories. 
+    - `--force` permits replacing another symlink, but never a real entry. 
+- Links created inside a Git worktree are added to the repository's local `.git/info/exclude` unless `--no-exclude` is used, tracked paths are rejected.
 
 ## Commands
 
 ```text
 source-add <url> [--name <name>] [--ref <ref>]
 source-sync [name]
-link <skill> <dest-dir>... [--as <name>] [--force] [--mkdir] [--no-exclude]
+link <source> <skill> [dest-dir...] [--as <name>] [--force] [--mkdir] [--no-exclude]
 unlink <link-path>...
 unlink --skill <name>
 list [skill] [--source <name>] [--links]
 ```
 
-See [`docs/GUIDE.md`](docs/GUIDE.md) for configuration, command semantics,
-Git behavior, troubleshooting, and development workflows.
-
-## Development
-
-```sh
-make check                 # format check and Debug tests
-make release               # ReleaseSafe build
-make static                # static Linux/musl package through Nix
-make nix-check             # all flake checks
-```
-
-GNU Make variables such as `ZIG`, `NIX`, `OPTIMIZE`, `PREFIX`, `DESTDIR`, and
-`ARGS` can be overridden on the command line.
+See [`docs/GUIDE.md`](docs/GUIDE.md) for configuration, command semantics, Git behavior, troubleshooting, and development workflows.
