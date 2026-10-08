@@ -2,6 +2,7 @@
 
 {
   linkFarm,
+  fetchFromGitHub,
   fetchzip,
   fetchgit,
 }:
@@ -32,8 +33,10 @@ linkFarm "zig-packages" [
   }
   {
     name = "curl-0.5.1-P4tT4T4AAQAWgbb1Iwh00q9raBCW4ZphsAkFh2U5oQ6X";
-    path = fetchzip {
-      url = "https://codeload.github.com/jiacai2050/zig-curl/tar.gz/refs/tags/v0.5.1";
+    path = fetchFromGitHub {
+      owner = "jiacai2050";
+      repo = "zig-curl";
+      rev = "v0.5.1";
       hash = "sha256-XQrpc4owq+IfcYEjvubtsYXv3Tkk0RKdwXPDUZdgiEY=";
     };
   }
