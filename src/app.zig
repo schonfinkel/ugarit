@@ -32,6 +32,7 @@ pub const Error = error{
     AmbiguousSkill,
     DestInsideSources,
     DestInsideSkill,
+    DefaultPathNotConfigured,
     InvalidLinkPath,
     FaultInjected,
 };
@@ -44,6 +45,7 @@ pub const Diagnostic = enum {
     ambiguous_skill,
     destination_inside_sources,
     destination_inside_skill,
+    default_path_not_configured,
     invalid_name,
     entry_in_the_way,
     tracked_link_path,
@@ -67,6 +69,7 @@ pub fn diagnostic(err: anyerror) Diagnostic {
         error.AmbiguousSkill => .ambiguous_skill,
         error.DestInsideSources => .destination_inside_sources,
         error.DestInsideSkill => .destination_inside_skill,
+        error.DefaultPathNotConfigured => .default_path_not_configured,
         error.InvalidName => .invalid_name,
         error.RealEntryInTheWay,
         error.ForeignLinkInTheWay,
@@ -97,6 +100,7 @@ pub fn diagnosticMessage(kind: Diagnostic) []const u8 {
         .ambiguous_skill => "skill name is ambiguous; use source/path",
         .destination_inside_sources => "destination is inside ugarit's sources directory",
         .destination_inside_skill => "destination is inside the selected skill",
+        .default_path_not_configured => "no destination provided and default_path is not configured",
         .invalid_name => "invalid name",
         .entry_in_the_way => "destination contains an entry ugarit will not replace",
         .tracked_link_path => "link path is tracked; remove it from the index first",
@@ -121,6 +125,7 @@ pub fn diagnosticExitCode(kind: Diagnostic) u8 {
         .ambiguous_skill,
         .destination_inside_sources,
         .destination_inside_skill,
+        .default_path_not_configured,
         .invalid_name,
         .entry_in_the_way,
         .tracked_link_path,
@@ -442,24 +447,39 @@ pub const LinkOptions = struct {
     no_exclude: bool = false,
 };
 
-pub fn link(ctx: *Context, query: []const u8, destinations: anytype, options: LinkOptions) !bool {
-    if (destinations.len == 0) return error.Usage;
+pub fn link(
+    ctx: *Context,
+    source: []const u8,
+    query: []const u8,
+    destinations: anytype,
+    options: LinkOptions,
+) !bool {
     var lock_file = try paths_mod.lock(ctx.io, ctx.rootDir());
     defer lock_file.close(ctx.io);
     try ctx.reload();
+    if (ctx.cfg.find(source) == null) return error.SourceNotFound;
     var idx = try ctx.scan();
     defer idx.deinit(ctx.a);
-    const skill = switch (idx.lookup(query)) {
+    const skill = switch (idx.lookupInSource(source, query)) {
         .found => |skill| skill,
         .missing => return error.SkillNotFound,
-        .ambiguous => |matches| {
-            try ctx.err.print("ugarit: '{s}' is ambiguous:\n", .{query});
-            for (matches) |skill| try ctx.err.print("  {s}/{s}\n", .{ skill.source, skill.rel_path });
+        .ambiguous => {
+            try ctx.err.print("ugarit: '{s}/{s}' is ambiguous:\n", .{ source, query });
+            try ctx.err.writeAll("  use the source-relative skill path\n");
             return error.AmbiguousSkill;
         },
     };
     const name = options.as orelse skill.name;
     try config.validateName(name);
+
+    if (destinations.len == 0) {
+        const raw = ctx.cfg.value.default_path orelse return error.DefaultPathNotConfigured;
+        linkOne(ctx, skill, name, raw, options) catch |err| {
+            try ctx.report(raw, err);
+            return false;
+        };
+        return true;
+    }
 
     var all_ok = true;
     for (destinations) |raw| {

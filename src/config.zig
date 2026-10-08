@@ -18,6 +18,7 @@ pub const SourceRepo = struct {
 
 pub const Config = struct {
     version: u32 = 1,
+    default_path: ?[]const u8 = null,
     sources: []const SourceRepo = &.{},
 };
 

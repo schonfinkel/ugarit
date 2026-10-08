@@ -36,6 +36,12 @@ pub const Lookup = union(enum) {
     ambiguous: []const Skill,
 };
 
+pub const SourceLookup = union(enum) {
+    found: Skill,
+    missing,
+    ambiguous,
+};
+
 pub const Index = struct {
     skills: []Skill,
     warnings: [][]const u8,
@@ -68,6 +74,33 @@ pub const Index = struct {
             0 => .missing,
             1 => .{ .found = self.skills[first.?] },
             else => .{ .ambiguous = self.skills[first.? .. first.? + count] },
+        };
+    }
+
+    /// Resolves a skill name or source-relative path within one source. Bare
+    /// names are case-insensitive; relative paths are exact and case-sensitive.
+    pub fn lookupInSource(self: Index, source: []const u8, query: []const u8) SourceLookup {
+        const is_path = std.mem.indexOfScalar(u8, query, '/') != null;
+        var lower_buf: [129]u8 = undefined;
+        const needle = if (is_path) query else asciiLowerInto(&lower_buf, query);
+        var first: ?usize = null;
+        var count: usize = 0;
+        for (self.skills, 0..) |skill, i| {
+            if (!std.mem.eql(u8, skill.source, source)) continue;
+            const matches = if (is_path)
+                std.mem.eql(u8, skill.rel_path, needle)
+            else blk: {
+                var name_buf: [129]u8 = undefined;
+                break :blk std.mem.eql(u8, asciiLowerInto(&name_buf, skill.name), needle);
+            };
+            if (!matches) continue;
+            if (first == null) first = i;
+            count += 1;
+        }
+        return switch (count) {
+            0 => .missing,
+            1 => .{ .found = self.skills[first.?] },
+            else => .ambiguous,
         };
     }
 
@@ -313,6 +346,16 @@ test "lookup query forms (b: illustrative table)" {
     try std.testing.expect(idx.lookup("rust") == .found);
     try std.testing.expect(idx.lookup("ghost") == .missing);
     try std.testing.expect(idx.lookup("one/zig") == .missing); // exact path only
+    switch (idx.lookupInSource("one", "ZIG")) {
+        .found => |s| try std.testing.expectEqualStrings("lang/zig", s.rel_path),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (idx.lookupInSource("two", "zig")) {
+        .found => |s| try std.testing.expectEqualStrings("Zig", s.rel_path),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(idx.lookupInSource("one", "lang/zig") == .found);
+    try std.testing.expect(idx.lookupInSource("two", "lang/zig") == .missing);
 }
 
 const ScanOomContext = struct { io: std.Io, sources: std.Io.Dir };

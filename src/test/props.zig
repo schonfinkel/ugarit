@@ -192,6 +192,8 @@ const SourceSeed = struct {
 };
 
 const ConfigSeed = struct {
+    has_default_path: bool,
+    default_path: []const u8,
     sources: []const SourceSeed,
 };
 
@@ -203,11 +205,15 @@ const source_seed_gen = gen.structure(SourceSeed, .{
 });
 
 const config_seed_gen = gen.structure(ConfigSeed, .{
+    .has_default_path = gen.boolean(),
+    .default_path = gen.string(.{ .min_len = 1, .max_len = 24, .charset = .printable }),
     .sources = gen.list(SourceSeed, source_seed_gen, 0, 5),
 });
 
 fn expectConfigEqual(expected: config.Config, actual: config.Config) !void {
     try expectEqual(expected.version, actual.version);
+    try expectEqual(expected.default_path == null, actual.default_path == null);
+    if (expected.default_path) |path| try expectEqualStrings(path, actual.default_path.?);
     try expectEqual(expected.sources.len, actual.sources.len);
     for (expected.sources, actual.sources) |e, o| {
         try expectEqualStrings(e.name, o.name);
@@ -230,7 +236,10 @@ fn configRoundTrip(seed: ConfigSeed) !void {
             .ref = if (s.has_ref) s.ref_val else null,
         };
     }
-    const cfg: config.Config = .{ .sources = sources };
+    const cfg: config.Config = .{
+        .default_path = if (seed.has_default_path) seed.default_path else null,
+        .sources = sources,
+    };
 
     var t = std.testing.tmpDir(.{});
     defer t.cleanup();
@@ -1784,7 +1793,7 @@ fn appStateMachine(ops: [16]u8) !void {
         switch ((raw / 3) % 5) {
             0, 4 => {
                 const values = [_][]const u8{dests[i]};
-                const ok = try ugarit.app.link(&ctx, "zig", &values, .{ .no_exclude = true });
+                const ok = try ugarit.app.link(&ctx, "central", "zig", &values, .{ .no_exclude = true });
                 if (fs_state[i] == .real) {
                     try std.testing.expect(!ok);
                 } else {
