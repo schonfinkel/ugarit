@@ -253,24 +253,18 @@ test "config save→load is the identity" {
     });
 }
 
-fn configRejectsBadBytes(bytes: []const u8) !void {
-    var t = std.testing.tmpDir(.{});
-    defer t.cleanup();
-    const io = std.testing.io;
-    try t.dir.writeFile(io, .{ .sub_path = "config.json", .data = bytes });
-    var loaded = config.load(std.testing.allocator, io, t.dir, "config.json") catch return;
-    defer loaded.deinit();
-    try config.validate(loaded.value);
-    try expectEqual(@as(u32, 1), loaded.value.version);
-}
-
-test "config load of arbitrary bytes is valid-v1-or-error" {
-    try minish.check(
-        std.testing.allocator,
-        gen.string(.{ .min_len = 0, .max_len = 64, .charset = .printable }),
-        configRejectsBadBytes,
-        .{ .seed = 0xdeadbeef, .num_runs = 200 },
-    );
+test "every proper prefix of a valid config is rejected" {
+    const bytes = "{\"version\":1,\"sources\":[{\"name\":\"a\",\"url\":\"u\"}]}";
+    for (0..bytes.len) |cut| {
+        var t = std.testing.tmpDir(.{});
+        defer t.cleanup();
+        try t.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = bytes[0..cut] });
+        if (config.load(std.testing.allocator, std.testing.io, t.dir, "config.json")) |value| {
+            var loaded = value;
+            loaded.deinit();
+            return error.ExpectedMalformedConfig;
+        } else |_| {}
+    }
 }
 
 fn configSpecificRejections(i: usize) !void {
@@ -294,18 +288,17 @@ fn configSpecificRejections(i: usize) !void {
     try t.dir.writeFile(io, .{ .sub_path = "config.json", .data = bytes[i] });
     if (expected[i]) |e| {
         try std.testing.expectError(e, config.load(std.testing.allocator, io, t.dir, "config.json"));
-    } else {
-        _ = config.load(std.testing.allocator, io, t.dir, "config.json") catch return;
+    } else if (config.load(std.testing.allocator, io, t.dir, "config.json")) |value| {
+        var loaded = value;
+        loaded.deinit();
+        return error.ExpectedConfigError;
+    } else |_| {
+        return;
     }
 }
 
 test "config load rejects malformed and invalid configs with the documented error" {
-    try minish.check(
-        std.testing.allocator,
-        gen.intRange(usize, 0, 4),
-        configSpecificRejections,
-        .{ .seed = 0x5be1c, .num_runs = 15 },
-    );
+    for (0..5) |i| try configSpecificRejections(i);
 }
 
 // ---------------------------------------------------------------------------
@@ -992,17 +985,41 @@ fn seedPreState(a: std.mem.Allocator, io: std.Io, env: *LinkEnv, pre: PreState) 
     defer a.free(gone_abs);
     const foreign_abs = try std.fs.path.join(a, &.{ env.root, "foreign" });
     defer a.free(foreign_abs);
+    try seedEntryPreState(io, env.dest, "zig", .{
+        .skill = env.skill.abs_path,
+        .other = other_abs,
+        .gone = gone_abs,
+        .foreign = foreign_abs,
+    }, pre);
+}
+
+/// Seeds `dest/name` with a pre-existing entry of the given class (the P7/P8
+/// pre-state pool, reusable in any environment).
+fn seedEntryPreState(
+    io: std.Io,
+    dest: std.Io.Dir,
+    name: []const u8,
+    targets: struct {
+        skill: []const u8,
+        other: []const u8,
+        gone: []const u8,
+        foreign: []const u8,
+    },
+    pre: PreState,
+) !void {
     switch (pre) {
         .absent => {},
-        .real_file => try env.dest.writeFile(io, .{ .sub_path = "zig", .data = "keep me\n" }),
+        .real_file => try dest.writeFile(io, .{ .sub_path = name, .data = "keep me\n" }),
         .real_dir => {
-            try env.dest.createDirPath(io, "zig");
-            try env.dest.writeFile(io, .{ .sub_path = "zig/keep.txt", .data = "keep me\n" });
+            var buf: [128]u8 = undefined;
+            const keep = try std.fmt.bufPrint(&buf, "{s}/keep.txt", .{name});
+            try dest.createDirPath(io, name);
+            try dest.writeFile(io, .{ .sub_path = keep, .data = "keep me\n" });
         },
-        .ours_same => try env.dest.symLink(io, env.skill.abs_path, "zig", .{ .is_directory = true }),
-        .ours_dangling => try env.dest.symLink(io, gone_abs, "zig", .{ .is_directory = true }),
-        .ours_other_live => try env.dest.symLink(io, other_abs, "zig", .{ .is_directory = true }),
-        .foreign_link => try env.dest.symLink(io, foreign_abs, "zig", .{ .is_directory = true }),
+        .ours_same => try dest.symLink(io, targets.skill, name, .{ .is_directory = true }),
+        .ours_dangling => try dest.symLink(io, targets.gone, name, .{ .is_directory = true }),
+        .ours_other_live => try dest.symLink(io, targets.other, name, .{ .is_directory = true }),
+        .foreign_link => try dest.symLink(io, targets.foreign, name, .{ .is_directory = true }),
     }
 }
 
@@ -1199,11 +1216,23 @@ fn excludeIsIdempotent(case: ExcludeCase) !void {
     while (i < case.n) : (i += 1) {
         const outcome = symlink.excludeInEnclosingRepo(a, io, link_abs);
         switch (case.scenario) {
-            0 => try expectEqual(if (i == 0)
-                symlink.ExcludeOutcome.excluded
-            else
-                symlink.ExcludeOutcome.already, try outcome),
-            1 => try expectEqual(symlink.ExcludeOutcome.already, try outcome),
+            0 => if (i == 0) {
+                switch (try outcome) {
+                    .excluded => |x| {
+                        defer a.free(x.line);
+                        try expectEqualStrings("/.claude/skills/zig", x.line);
+                        try std.testing.expect(!x.added_separator); // fresh exclude file ends clean
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+            } else switch (try outcome) {
+                .already => {},
+                else => return error.TestUnexpectedResult,
+            },
+            1 => switch (try outcome) {
+                .already => {},
+                else => return error.TestUnexpectedResult,
+            },
             2 => try std.testing.expectError(error.LinkPathTrackedInRepo, outcome),
             else => unreachable,
         }
@@ -1249,6 +1278,145 @@ test "excludeInEnclosingRepo appends at most one line, never writes outside" {
     try minish.check(std.testing.allocator, exclude_gen, excludeIsIdempotent, .{
         .seed = 0x9c1ad,
         .num_runs = 45,
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Property: a failed `link` inside a git repository leaves both the
+// destination and the repo's info/exclude byte-identical — the exclude line
+// appended before the link attempt is taken back out when the link does not
+// land (exclude idempotence × atomic visibility).
+// ---------------------------------------------------------------------------
+
+const RepoLinkCase = struct { pre: u8, point: u8 };
+
+fn readExcludeFile(a: std.mem.Allocator, io: std.Io, proj: []const u8) !?[]u8 {
+    const exclude_abs = try std.fs.path.join(a, &.{ proj, ".git/info/exclude" });
+    defer a.free(exclude_abs);
+    return std.Io.Dir.cwd().readFileAlloc(io, exclude_abs, a, .limited(1 << 20)) catch |e| switch (e) {
+        error.FileNotFound => null,
+        else => return e,
+    };
+}
+
+fn failedRepoLinkLeavesNoTrace(case: RepoLinkCase) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const lg = try fx.Libgit2.init();
+    defer lg.deinit();
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+
+    // A real project repo; the destination lives inside its worktree.
+    const proj = try fx.initOrigin(a, io, t.dir, "proj");
+    defer a.free(proj);
+    try fx.commitFile(io, proj, "README.md", "readme\n");
+    try t.dir.createDirPath(io, "proj/.claude/skills");
+
+    // A managed home whose single source is a plain directory (no git
+    // needed on the sources side).
+    try t.dir.createDirPath(io, "managed/sources/central/zig");
+    try t.dir.writeFile(io, .{ .sub_path = "managed/sources/central/zig/SKILL.md", .data = "v\n" });
+    try t.dir.createDirPath(io, "managed/sources/central/other");
+    try t.dir.writeFile(io, .{ .sub_path = "managed/sources/central/other/SKILL.md", .data = "o\n" });
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try t.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const managed = try std.fs.path.join(a, &.{ root, "managed" });
+    defer a.free(managed);
+    const dest = try std.fs.path.join(a, &.{ proj, ".claude/skills" });
+    defer a.free(dest);
+    const skill_abs = try std.fs.path.join(a, &.{ managed, "sources/central/zig" });
+    defer a.free(skill_abs);
+    const other_abs = try std.fs.path.join(a, &.{ managed, "sources/central/other" });
+    defer a.free(other_abs);
+    const gone_abs = try std.fs.path.join(a, &.{ managed, "sources/central/deleted" });
+    defer a.free(gone_abs);
+    const foreign_abs = try std.fs.path.join(a, &.{ root, "foreign" });
+    defer a.free(foreign_abs);
+    const skill = discovery.Skill{
+        .name = "zig",
+        .source = "central",
+        .rel_path = "zig",
+        .abs_path = skill_abs,
+    };
+
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", root);
+    var out_buf: [8192]u8 = undefined;
+    var out = std.Io.Writer.fixed(&out_buf);
+    var err_buf: [8192]u8 = undefined;
+    var err = std.Io.Writer.fixed(&err_buf);
+    var ctx = try ugarit.app.Context.init(a, io, &env, managed, &out, &err);
+    defer ctx.deinit();
+
+    {
+        var dest_dir = try std.Io.Dir.openDirAbsolute(io, dest, .{ .iterate = true });
+        defer dest_dir.close(io);
+        try seedEntryPreState(io, dest_dir, "zig", .{
+            .skill = skill_abs,
+            .other = other_abs,
+            .gone = gone_abs,
+            .foreign = foreign_abs,
+        }, ([_]PreState{ .absent, .ours_dangling, .ours_other_live, .foreign_link })[case.pre]);
+    }
+
+    const before_exclude = try readExcludeFile(a, io, proj);
+    defer if (before_exclude) |b| a.free(b);
+    {
+        var dest_dir = try std.Io.Dir.openDirAbsolute(io, dest, .{ .iterate = true });
+        defer dest_dir.close(io);
+        const before_dest_snap = try snapshotDest(a, io, dest_dir);
+        defer freeDestSnapshot(a, before_dest_snap);
+
+        symlink.fault = symlinkFaultFn;
+        defer symlink.fault = null;
+        fault_at = @enumFromInt(case.point);
+
+        const result = ugarit.app.linkOne(&ctx, skill, "zig", dest, .{ .force = true });
+        fault_at = null;
+
+        try std.testing.expectError(error.FaultInjected, result);
+
+        // Failure: destination and info/exclude byte-identical to before.
+        const after_dest = try snapshotDest(a, io, dest_dir);
+        defer freeDestSnapshot(a, after_dest);
+        try expectEqual(before_dest_snap.len, after_dest.len);
+        for (before_dest_snap, after_dest) |x, y| {
+            try expectEqualStrings(x.name, y.name);
+            try expectEqual(x.kind, y.kind);
+            if (x.kind == 3) try expectEqualStrings(x.target, y.target);
+        }
+        const after_exclude = try readExcludeFile(a, io, proj);
+        defer if (after_exclude) |x| a.free(x);
+        if (before_exclude == null) {
+            try std.testing.expect(after_exclude == null);
+        } else {
+            try expectEqualStrings(before_exclude.?, after_exclude.?);
+        }
+    }
+
+    // Recovery with faults cleared converges to the requested link. The repo
+    // may already ignore the path via another rule, so a Ugarit-owned line is
+    // not required in that case.
+    try ugarit.app.linkOne(&ctx, skill, "zig", dest, .{ .force = true });
+    var dest_dir = try std.Io.Dir.openDirAbsolute(io, dest, .{ .iterate = true });
+    defer dest_dir.close(io);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try dest_dir.readLink(io, "zig", &buf);
+    try expectEqualStrings(skill_abs, buf[0..n]);
+}
+
+test "a failed link inside a repo leaves dest and info/exclude byte-identical" {
+    const repo_link_gen = gen.structure(RepoLinkCase, .{
+        .pre = gen.intRange(u8, 0, 3),
+        .point = gen.intRange(u8, 0, 1),
+    });
+    try minish.check(std.testing.allocator, repo_link_gen, failedRepoLinkLeavesNoTrace, .{
+        .seed = 0xacc7,
+        .num_runs = 56,
     });
 }
 
@@ -1598,7 +1766,7 @@ fn appStateMachine(ops: [16]u8) !void {
     var ctx = try ugarit.app.Context.init(a, io, &env, managed, &out, &err);
     defer ctx.deinit();
     try ctx.cfg.append(.{ .name = "central", .url = "/unused" });
-    try config.save(a, io, ctx.root_dir, ctx.cfg.value);
+    try config.save(a, io, ctx.root_dir.?, ctx.cfg.value);
 
     var dests: [3][]const u8 = undefined;
     defer for (dests) |dest| a.free(dest);

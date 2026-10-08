@@ -103,15 +103,43 @@ pub const Registry = struct {
         };
     }
 
+    /// A registry save whose bytes are already written and flushed to a
+    /// temporary file; only the atomic rename remains (failure atomicity).
+    /// Preparing *before* a filesystem mutation means every fallible write
+    /// happens before anything changes, so an I/O failure (disk full,
+    /// unwritable directory) leaves both sides untouched.
+    pub const PreparedSave = struct {
+        af: std.Io.File.Atomic,
+
+        /// Writes `bytes` into a fresh temp file next to `links.json` in `dir`
+        /// and flushes it. Assumes `bytes` came from `encode`.
+        pub fn prepare(io: std.Io, dir: std.Io.Dir, bytes: []const u8) !PreparedSave {
+            var af = try dir.createFileAtomic(io, "links.json", .{ .replace = true });
+            errdefer af.deinit(io);
+            var buf: [4096]u8 = undefined;
+            var w = af.file.writer(io, &buf);
+            try w.interface.writeAll(bytes);
+            try w.flush();
+            return .{ .af = af };
+        }
+
+        /// Atomically moves the prepared file over `links.json`: a bare
+        /// rename, the only remaining failure point.
+        pub fn commit(self: *PreparedSave, io: std.Io) !void {
+            try self.af.replace(io);
+        }
+
+        /// Discards the prepared file; `links.json` is unchanged.
+        pub fn deinit(self: *PreparedSave, io: std.Io) void {
+            self.af.deinit(io);
+        }
+    };
+
     /// Atomically persists already-serialized bytes without allocating.
     pub fn saveBytes(io: std.Io, dir: std.Io.Dir, bytes: []const u8) !void {
-        var af = try dir.createFileAtomic(io, "links.json", .{ .replace = true });
-        defer af.deinit(io);
-        var buf: [4096]u8 = undefined;
-        var w = af.file.writer(io, &buf);
-        try w.interface.writeAll(bytes);
-        try w.flush();
-        try af.replace(io);
+        var prepared = try PreparedSave.prepare(io, dir, bytes);
+        defer prepared.deinit(io);
+        try prepared.commit(io);
     }
 
     /// Inserts or replaces the entry for `(link.host, link.path)` (completeness).
@@ -170,7 +198,11 @@ pub const Registry = struct {
     /// After a sync of `source`: every *dangling* link of this host for that
     /// source is relinked when the skill name resolves uniquely inside the
     /// same source (repair preserves identity); the entry's `rel_path` is
-    /// updated in place. Everything else is reported, never touched (ownership).
+    /// updated in place. A link that already points at exactly the unique
+    /// same-name skill — the residue of an earlier repair whose registry save
+    /// was interrupted — has its entry *adopted* to match reality, with no
+    /// filesystem change. Everything else is reported, never touched
+    /// (ownership).
     pub fn repair(
         self: *Registry,
         a: std.mem.Allocator,
@@ -184,6 +216,9 @@ pub const Registry = struct {
             link_index: usize,
             skill: discovery.Skill,
             rel_path: ?[]u8,
+            /// False when the link already points at `skill` (adoption):
+            /// only the registry entry is updated.
+            relink: bool,
         };
 
         var repaired: std.ArrayList(Link) = .empty;
@@ -206,7 +241,62 @@ pub const Registry = struct {
         // publishing registry state. OOM therefore leaves the operation inert.
         for (self.links, 0..) |l, link_index| {
             if (!std.mem.eql(u8, l.host, host) or !std.mem.eql(u8, l.source, source)) continue;
-            if (try status(io, l, sources_real) != .dangling) continue;
+
+            const parent = std.fs.path.dirname(l.path) orelse return error.InvalidRegistryPath;
+            var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch |e| switch (e) {
+                error.FileNotFound => continue, // the whole project is gone
+                else => return e,
+            };
+            defer dir.close(io);
+            var cbuf: [std.fs.max_path_bytes]u8 = undefined;
+            const cls = try symlink.classify(io, dir, std.fs.path.basename(l.path), sources_real, &cbuf);
+            const ours = switch (cls) {
+                // missing, replaced: nothing to repair here (`list` shows them)
+                .absent, .real, .foreign_link => continue,
+                .ours => |o| o,
+            };
+
+            if (!ours.dangling) {
+                // Adoption: the relink already happened but the registry save
+                // was interrupted (failure atomicity residue). The target must
+                // be exactly the unique same-name skill in the same source;
+                // a deliberate user retarget stays untouched.
+                var want_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const want = expectedTarget(l, sources_real, &want_buf) catch
+                    return error.NameTooLong;
+                if (std.mem.eql(u8, ours.target, want)) continue; // ok
+                var match: ?discovery.Skill = null;
+                for (idx.skills) |s| {
+                    if (!std.mem.eql(u8, s.source, source)) continue;
+                    if (!std.mem.eql(u8, s.name, l.skill)) continue;
+                    if (!std.mem.eql(u8, s.abs_path, ours.target)) continue;
+                    match = s;
+                    break;
+                }
+                const skill = match orelse continue;
+                try pending.ensureUnusedCapacity(a, 1);
+                try repaired.ensureUnusedCapacity(a, 1);
+                {
+                    const registry_rel_path = try a.dupe(u8, skill.rel_path);
+                    errdefer a.free(registry_rel_path);
+                    const report_rel_path = try a.dupe(u8, skill.rel_path);
+                    errdefer a.free(report_rel_path);
+                    pending.appendAssumeCapacity(.{
+                        .link_index = link_index,
+                        .skill = skill,
+                        .rel_path = registry_rel_path,
+                        .relink = false,
+                    });
+                    repaired.appendAssumeCapacity(.{
+                        .path = l.path,
+                        .source = l.source,
+                        .rel_path = report_rel_path,
+                        .skill = l.skill,
+                        .host = l.host,
+                    });
+                }
+                continue;
+            }
 
             // repair preserves identity: a unique same-name skill in the same source
             var match: ?discovery.Skill = null;
@@ -244,6 +334,7 @@ pub const Registry = struct {
                     .link_index = link_index,
                     .skill = skill,
                     .rel_path = registry_rel_path,
+                    .relink = true,
                 });
                 repaired.appendAssumeCapacity(.{
                     .path = l.path,
@@ -262,11 +353,13 @@ pub const Registry = struct {
 
         for (pending.items) |*p| {
             const l = &self.links[p.link_index];
-            const parent = std.fs.path.dirname(l.path) orelse return error.InvalidRegistryPath;
-            var dir = try std.Io.Dir.openDirAbsolute(io, parent, .{ .iterate = true });
-            defer dir.close(io);
-            const outcome = try symlink.link(io, dir, std.fs.path.basename(l.path), p.skill, sources_real, false);
-            std.debug.assert(outcome == .replaced); // was dangling and ours
+            if (p.relink) {
+                const parent = std.fs.path.dirname(l.path) orelse return error.InvalidRegistryPath;
+                var dir = try std.Io.Dir.openDirAbsolute(io, parent, .{ .iterate = true });
+                defer dir.close(io);
+                const outcome = try symlink.link(io, dir, std.fs.path.basename(l.path), p.skill, sources_real, false);
+                std.debug.assert(outcome == .replaced); // was dangling and ours
+            }
             const replaced_rel_path = l.rel_path;
             l.rel_path = p.rel_path.?;
             p.rel_path = null;
@@ -631,4 +724,82 @@ test "repair reporting preserves ownership under every OOM (a: exhaustive alloca
             .sources_real = sources_real,
         }},
     );
+}
+
+// Repair preserves identity: adoption takes only links that already point at
+// exactly the unique same-name skill (interrupted-repair residue); a link
+// retargeted to a *different* skill is left alone and unreported.
+test "repair adopts an interrupted relink but not a deliberate retarget (b: illustrative decision table)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    try t.dir.createDirPath(io, "sources/source/repaired");
+    try t.dir.createDirPath(io, "sources/source/other");
+    try t.dir.createDirPath(io, "dest");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try t.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const sources_real = try std.fs.path.join(a, &.{ root, "sources" });
+    defer a.free(sources_real);
+    const adopted_path = try std.fs.path.join(a, &.{ root, "dest", "adopt" });
+    defer a.free(adopted_path);
+    const adopted_target = try std.fs.path.join(a, &.{ sources_real, "source", "repaired" });
+    defer a.free(adopted_target);
+    const retarget_path = try std.fs.path.join(a, &.{ root, "dest", "hand" });
+    defer a.free(retarget_path);
+    const retarget_target = try std.fs.path.join(a, &.{ sources_real, "source", "other" });
+    defer a.free(retarget_target);
+
+    {
+        var dest = try t.dir.openDir(io, "dest", .{});
+        defer dest.close(io);
+        try dest.symLink(io, adopted_target, "adopt", .{ .is_directory = true });
+        try dest.symLink(io, retarget_target, "hand", .{ .is_directory = true });
+    }
+
+    var reg: Registry = .{};
+    defer reg.deinit(a);
+    // Both entries claim the skill moved away from "gone/repaired": the first
+    // link already points at the unique same-name replacement (adopt), the
+    // second points somewhere unrelated (leave).
+    try reg.upsert(a, .{
+        .path = adopted_path,
+        .source = "source",
+        .rel_path = "gone/repaired",
+        .skill = "repaired",
+        .host = "box",
+    });
+    try reg.upsert(a, .{
+        .path = retarget_path,
+        .source = "source",
+        .rel_path = "gone/repaired",
+        .skill = "repaired",
+        .host = "box",
+    });
+
+    var skills = [_]discovery.Skill{.{
+        .name = "repaired",
+        .source = "source",
+        .rel_path = "repaired",
+        .abs_path = adopted_target,
+    }};
+    var report = try reg.repair(
+        a,
+        io,
+        .{ .skills = &skills, .warnings = &.{} },
+        "source",
+        "box",
+        sources_real,
+    );
+    defer report.deinit(a);
+
+    try std.testing.expectEqual(@as(usize, 1), report.repaired.len);
+    try std.testing.expectEqual(@as(usize, 0), report.dangling.len);
+    try std.testing.expectEqualStrings(adopted_path, report.repaired[0].path);
+    try std.testing.expectEqualStrings("repaired", reg.links[0].rel_path);
+    try std.testing.expectEqualStrings("gone/repaired", reg.links[1].rel_path);
+    try std.testing.expectEqual(State.ok, try status(io, reg.links[0], sources_real));
+    try std.testing.expectEqual(State.retargeted, try status(io, reg.links[1], sources_real));
 }

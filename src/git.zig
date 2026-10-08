@@ -341,7 +341,8 @@ pub fn sync(
     if (rc != 0) {
         if (rc != c.GIT_ENOTFOUND) try check(rc);
         var oid: c.git_oid = undefined;
-        if (!try remoteTipOid(repo, &oid)) return .up_to_date; // origin still empty
+        if (!try remoteTipOid(repo, &oid) and
+            !try remoteDefaultTipOid(repo, remote, &fo, &oid)) return .up_to_date; // origin still empty
         try check(c.git_annotated_commit_lookup(&upstream, repo, &oid));
     }
     defer c.git_annotated_commit_free(upstream);
@@ -383,6 +384,41 @@ fn remoteTipOid(repo: ?*c.git_repository, out: *c.git_oid) Error!bool {
     const rc = c.git_reference_name_to_id(out, repo, remote_ref);
     if (rc == c.GIT_ENOTFOUND) return false;
     try check(rc);
+    return true;
+}
+
+/// Resolves the advertised default branch after an empty clone whose local
+/// unborn branch name differs from the remote's default branch.
+fn remoteDefaultTipOid(
+    repo: ?*c.git_repository,
+    remote: ?*c.git_remote,
+    fo: *const c.git_fetch_options,
+    out: *c.git_oid,
+) Error!bool {
+    try check(c.git_remote_connect(
+        remote,
+        c.GIT_DIRECTION_FETCH,
+        &fo.callbacks,
+        &fo.proxy_opts,
+        null,
+    ));
+    defer _ = c.git_remote_disconnect(remote);
+
+    var branch: c.git_buf = .{};
+    defer c.git_buf_dispose(&branch);
+    const rc = c.git_remote_default_branch(&branch, remote);
+    if (rc == c.GIT_ENOTFOUND) return false;
+    try check(rc);
+    if (branch.ptr == null) return error.Git;
+    const full = std.mem.span(branch.ptr);
+    if (!std.mem.startsWith(u8, full, "refs/heads/")) return error.Git;
+
+    var buf: [256]u8 = undefined;
+    const remote_ref = std.fmt.bufPrintZ(&buf, "refs/remotes/origin/{s}", .{full["refs/heads/".len..]}) catch
+        return error.Git;
+    const lookup_rc = c.git_reference_name_to_id(out, repo, remote_ref);
+    if (lookup_rc == c.GIT_ENOTFOUND) return false;
+    try check(lookup_rc);
     return true;
 }
 

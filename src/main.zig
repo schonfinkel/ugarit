@@ -75,14 +75,14 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer ugarit.git.deinit();
 
-    var ctx = ugarit.app.Context.init(
-        a,
-        io,
-        init.environ_map,
-        parsed.options.@"config-dir",
-        stdout,
-        stderr,
-    ) catch |err| {
+    const mode: ugarit.app.Mode = switch (parsed.options.__commands__) {
+        .list => .read_only,
+        else => .mutating,
+    };
+    var ctx = (if (mode == .read_only)
+        ugarit.app.Context.initReadOnly(a, io, init.environ_map, parsed.options.@"config-dir", stdout, stderr)
+    else
+        ugarit.app.Context.init(a, io, init.environ_map, parsed.options.@"config-dir", stdout, stderr)) catch |err| {
         try report(stderr, err);
         try stderr.flush();
         return ugarit.app.diagnosticExitCode(ugarit.app.diagnostic(err));

@@ -86,10 +86,25 @@ pub const Index = struct {
 };
 
 /// Scans every configured source under `sources_dir` (discovery determinism
-/// and confinement).
-pub fn scan(a: std.mem.Allocator, io: std.Io, sources_dir: std.Io.Dir, cfg: config.Config) !Index {
+/// and confinement). A null `sources_dir` yields no skills and one
+/// "not cloned" warning per configured source.
+pub fn scan(a: std.mem.Allocator, io: std.Io, sources_dir: ?std.Io.Dir, cfg: config.Config) !Index {
+    const dir = sources_dir orelse {
+        var warnings: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (warnings.items) |w| a.free(w);
+            warnings.deinit(a);
+        }
+        for (cfg.sources) |src| {
+            const msg = try std.fmt.allocPrint(a, "source '{s}' not cloned; run source-sync", .{src.name});
+            errdefer a.free(msg);
+            try warnings.append(a, msg);
+        }
+        return .{ .skills = &.{}, .warnings = try warnings.toOwnedSlice(a) };
+    };
+
     var rp_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sources_real_len = try sources_dir.realPath(io, &rp_buf);
+    const sources_real_len = try dir.realPath(io, &rp_buf);
     const sources_real = rp_buf[0..sources_real_len];
 
     var skills: std.ArrayList(Skill) = .empty;
@@ -104,7 +119,7 @@ pub fn scan(a: std.mem.Allocator, io: std.Io, sources_dir: std.Io.Dir, cfg: conf
     }
 
     for (cfg.sources) |src| {
-        var root = sources_dir.openDir(io, src.name, .{ .iterate = true, .follow_symlinks = false }) catch |e| switch (e) {
+        var root = dir.openDir(io, src.name, .{ .iterate = true, .follow_symlinks = false }) catch |e| switch (e) {
             error.FileNotFound => {
                 try warn(a, &warnings, "source '{s}' not cloned; run source-sync", .{src.name});
                 continue;

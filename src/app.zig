@@ -137,7 +137,7 @@ pub fn diagnosticExitCode(kind: Diagnostic) u8 {
     };
 }
 
-pub const FaultPoint = enum { before_config_save };
+pub const FaultPoint = enum { before_config_save, before_registry_commit, before_registry_save };
 pub const FaultFn = *const fn (FaultPoint) bool;
 pub var fault: if (builtin.is_test) ?FaultFn else void = if (builtin.is_test) null else {};
 
@@ -147,24 +147,33 @@ fn failAt(point: FaultPoint) Error!void {
     }
 }
 
+/// How a context touches the managed tree. Mutating contexts create and open
+/// the managed root and sources directory; read-only contexts open only what
+/// already exists and create nothing (read-only purity).
+pub const Mode = enum { mutating, read_only };
+
 pub const Context = struct {
     a: std.mem.Allocator,
     io: std.Io,
     env: ?*const std.process.Environ.Map,
     paths: paths_mod.Paths,
-    root_dir: std.Io.Dir,
-    sources_dir: std.Io.Dir,
+    /// Null only in read-only mode when the managed root does not exist.
+    root_dir: ?std.Io.Dir,
+    /// Null only in read-only mode when the sources directory does not exist.
+    sources_dir: ?std.Io.Dir,
     cfg: config.ManagedConfig,
     registry: Registry,
     host: []const u8,
     home: ?[]const u8,
+    /// Realpath of sources when it exists; otherwise the logical path (used
+    /// only for `list` classification).
     sources_real: []const u8,
     out: *std.Io.Writer,
     err: *std.Io.Writer,
 
     /// Creates the managed root and sources directory, then loads both JSON
     /// documents. The returned context owns every field except the writers and
-    /// environment map.
+    /// environment map. Both directory handles are non-null.
     pub fn init(
         a: std.mem.Allocator,
         io: std.Io,
@@ -172,6 +181,32 @@ pub const Context = struct {
         config_dir: ?[]const u8,
         out: *std.Io.Writer,
         err: *std.Io.Writer,
+    ) !Context {
+        return initInMode(a, io, env, config_dir, out, err, .mutating);
+    }
+
+    /// Like `init`, but never creates the managed root or sources directory:
+    /// a missing root yields the default config and an empty registry, and a
+    /// missing sources directory yields per-source "not cloned" warnings.
+    pub fn initReadOnly(
+        a: std.mem.Allocator,
+        io: std.Io,
+        env: ?*const std.process.Environ.Map,
+        config_dir: ?[]const u8,
+        out: *std.Io.Writer,
+        err: *std.Io.Writer,
+    ) !Context {
+        return initInMode(a, io, env, config_dir, out, err, .read_only);
+    }
+
+    fn initInMode(
+        a: std.mem.Allocator,
+        io: std.Io,
+        env: ?*const std.process.Environ.Map,
+        config_dir: ?[]const u8,
+        out: *std.Io.Writer,
+        err: *std.Io.Writer,
+        mode: Mode,
     ) !Context {
         const empty_env = std.process.Environ.Map.init(a);
         var owned_empty = empty_env;
@@ -181,25 +216,47 @@ pub const Context = struct {
 
         const resolved = try paths_mod.Paths.resolve(a, environ, config_dir);
         errdefer resolved.deinit(a);
-        try std.Io.Dir.cwd().createDirPath(io, resolved.root);
-        try std.Io.Dir.cwd().createDirPath(io, resolved.sources);
+        if (mode == .mutating) {
+            try std.Io.Dir.cwd().createDirPath(io, resolved.root);
+            try std.Io.Dir.cwd().createDirPath(io, resolved.sources);
+        }
 
-        var root_dir = try std.Io.Dir.openDirAbsolute(io, resolved.root, .{});
-        errdefer root_dir.close(io);
-        var sources_dir = try std.Io.Dir.openDirAbsolute(io, resolved.sources, .{ .iterate = true });
-        errdefer sources_dir.close(io);
+        var root_dir: ?std.Io.Dir = openOptional(io, resolved.root, .{}) catch |e| switch (e) {
+            error.FileNotFound => if (mode == .mutating) return e else null,
+            else => return e,
+        };
+        errdefer if (root_dir) |*d| d.close(io);
 
-        var cfg = try config.load(a, io, root_dir, "config.json");
+        var cfg: config.ManagedConfig = undefined;
+        var loaded: registry_mod.Loaded = undefined;
+        if (root_dir) |rd| {
+            cfg = try config.load(a, io, rd, "config.json");
+            loaded = try Registry.load(a, io, rd, "links.json");
+        } else {
+            cfg = .{ .arena = std.heap.ArenaAllocator.init(a), .value = .{} };
+            loaded = .{ .registry = .{}, .duplicates = 0 };
+        }
         errdefer cfg.deinit();
-        var loaded = try Registry.load(a, io, root_dir, "links.json");
         errdefer loaded.deinit(a);
+
+        var sources_dir: ?std.Io.Dir = openOptional(io, resolved.sources, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound => if (mode == .mutating) return e else null,
+            else => return e,
+        };
+        errdefer if (sources_dir) |*d| d.close(io);
 
         var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
         const host = try a.dupe(u8, try std.posix.gethostname(&host_buf));
         errdefer a.free(host);
         var real_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const real_len = try sources_dir.realPath(io, &real_buf);
-        const sources_real = try a.dupe(u8, real_buf[0..real_len]);
+        const real_len = if (sources_dir) |sd|
+            try sd.realPath(io, &real_buf)
+        else
+            0;
+        const sources_real = try a.dupe(u8, if (sources_dir != null)
+            real_buf[0..real_len]
+        else
+            resolved.sources);
         errdefer a.free(sources_real);
 
         if (loaded.duplicates != 0) {
@@ -222,21 +279,33 @@ pub const Context = struct {
         };
     }
 
+    /// The managed root handle. Assumes a mutating context, which always
+    /// creates and opens the root (see `init`).
+    fn rootDir(self: *Context) std.Io.Dir {
+        return self.root_dir.?;
+    }
+
+    /// The sources directory handle. Assumes a mutating context.
+    fn sourcesDir(self: *Context) std.Io.Dir {
+        return self.sources_dir.?;
+    }
+
     pub fn deinit(self: *Context) void {
         self.a.free(self.sources_real);
         self.a.free(self.host);
         self.registry.deinit(self.a);
         self.cfg.deinit();
-        self.sources_dir.close(self.io);
-        self.root_dir.close(self.io);
+        if (self.sources_dir) |*d| d.close(self.io);
+        if (self.root_dir) |*d| d.close(self.io);
         self.paths.deinit(self.a);
         self.* = undefined;
     }
 
     fn reload(self: *Context) !void {
-        var cfg = try config.load(self.a, self.io, self.root_dir, "config.json");
+        const rd = self.rootDir();
+        var cfg = try config.load(self.a, self.io, rd, "config.json");
         errdefer cfg.deinit();
-        var loaded = try Registry.load(self.a, self.io, self.root_dir, "links.json");
+        var loaded = try Registry.load(self.a, self.io, rd, "links.json");
         errdefer loaded.deinit(self.a);
         self.cfg.deinit();
         self.registry.deinit(self.a);
@@ -262,13 +331,19 @@ pub const Context = struct {
     }
 };
 
+/// Opens `abs` with `options`, mapping a missing path to `error.FileNotFound`
+/// unchanged (the caller decides whether absence is expected).
+fn openOptional(io: std.Io, abs: []const u8, options: std.Io.Dir.OpenOptions) !std.Io.Dir {
+    return std.Io.Dir.openDirAbsolute(io, abs, options);
+}
+
 pub const SourceAddOptions = struct {
     name: ?[]const u8 = null,
     ref: ?[]const u8 = null,
 };
 
 pub fn sourceAdd(ctx: *Context, url: []const u8, options: SourceAddOptions) !void {
-    var lock_file = try paths_mod.lock(ctx.io, ctx.root_dir);
+    var lock_file = try paths_mod.lock(ctx.io, ctx.rootDir());
     defer lock_file.close(ctx.io);
     try ctx.reload();
 
@@ -294,11 +369,11 @@ pub fn sourceAdd(ctx: *Context, url: []const u8, options: SourceAddOptions) !voi
     defer ctx.a.free(url_z);
     const ref_z = if (options.ref) |ref| try ctx.a.dupeZ(u8, ref) else null;
     defer if (ref_z) |ref| ctx.a.free(ref);
-    try git.clone(ctx.a, ctx.io, ctx.sources_dir, ctx.env, url_z, name, ref_z);
+    try git.clone(ctx.a, ctx.io, ctx.sourcesDir(), ctx.env, url_z, name, ref_z);
     var persisted = false;
-    errdefer if (!persisted) ctx.sources_dir.deleteTree(ctx.io, name) catch {};
+    errdefer if (!persisted) ctx.sourcesDir().deleteTree(ctx.io, name) catch {};
     try failAt(.before_config_save);
-    try config.save(ctx.a, ctx.io, ctx.root_dir, ctx.cfg.value);
+    try config.save(ctx.a, ctx.io, ctx.rootDir(), ctx.cfg.value);
     config_persisted = true;
     persisted = true;
 
@@ -308,7 +383,7 @@ pub fn sourceAdd(ctx: *Context, url: []const u8, options: SourceAddOptions) !voi
 }
 
 pub fn sourceSync(ctx: *Context, selected: ?[]const u8) !bool {
-    var lock_file = try paths_mod.lock(ctx.io, ctx.root_dir);
+    var lock_file = try paths_mod.lock(ctx.io, ctx.rootDir());
     defer lock_file.close(ctx.io);
     try ctx.reload();
     if (selected) |name| if (ctx.cfg.find(name) == null) return error.SourceNotFound;
@@ -355,7 +430,8 @@ pub fn sourceSync(ctx: *Context, selected: ?[]const u8) !bool {
         for (repair.repaired) |entry| try ctx.out.print("repaired {s}\n", .{entry.path});
         for (repair.dangling) |entry| try ctx.err.print("dangling {s}\n", .{entry.path});
     }
-    try ctx.registry.save(ctx.a, ctx.io, ctx.root_dir);
+    try failAt(.before_registry_save);
+    try ctx.registry.save(ctx.a, ctx.io, ctx.rootDir());
     return all_ok;
 }
 
@@ -368,7 +444,7 @@ pub const LinkOptions = struct {
 
 pub fn link(ctx: *Context, query: []const u8, destinations: anytype, options: LinkOptions) !bool {
     if (destinations.len == 0) return error.Usage;
-    var lock_file = try paths_mod.lock(ctx.io, ctx.root_dir);
+    var lock_file = try paths_mod.lock(ctx.io, ctx.rootDir());
     defer lock_file.close(ctx.io);
     try ctx.reload();
     var idx = try ctx.scan();
@@ -413,7 +489,8 @@ pub fn linkOne(
     // Prepare every registry allocation before touching the destination. If
     // allocation fails, both disk and live registry remain unchanged.
     var candidate = try cloneRegistry(ctx.a, ctx.registry);
-    errdefer candidate.deinit(ctx.a);
+    var candidate_owned = true;
+    errdefer if (candidate_owned) candidate.deinit(ctx.a);
     try candidate.upsert(ctx.a, .{
         .path = link_abs,
         .source = skill.source,
@@ -427,10 +504,33 @@ pub fn linkOne(
     var dir = try std.Io.Dir.openDirAbsolute(ctx.io, dest, .{ .iterate = true });
     defer dir.close(ctx.io);
     try preflightLink(ctx, dir, name, skill, options.force);
-    if (!options.no_exclude) _ = try symlink.excludeInEnclosingRepo(ctx.a, ctx.io, link_abs);
-    const outcome = try symlink.link(ctx.io, dir, name, skill, ctx.sources_real, options.force);
-    try Registry.saveBytes(ctx.io, ctx.root_dir, registry_bytes);
+
+    // Failure atomicity: write and flush the registry bytes *before* touching
+    // the destination, so every fallible registry I/O happens while both
+    // sides are still untouched; only the atomic rename comes after the link.
+    var prepared = try Registry.PreparedSave.prepare(ctx.io, ctx.rootDir(), registry_bytes);
+    errdefer prepared.deinit(ctx.io);
+
+    // Exclude idempotence: remember exactly what this call appended so a
+    // failed link can put info/exclude back byte-for-byte.
+    var exclusion: ?symlink.Exclusion = null;
+    defer if (exclusion) |x| ctx.a.free(x.line);
+    if (!options.no_exclude) switch (try symlink.excludeInEnclosingRepo(ctx.a, ctx.io, link_abs)) {
+        .excluded => |x| exclusion = x,
+        else => {},
+    };
+
+    const outcome = symlink.link(ctx.io, dir, name, skill, ctx.sources_real, options.force) catch |e| {
+        if (exclusion) |x| {
+            symlink.revertExcludeLine(ctx.a, ctx.io, link_abs, x) catch {};
+        }
+        return e;
+    };
+
+    try failAt(.before_registry_commit);
+    try prepared.commit(ctx.io);
     replaceRegistry(ctx, candidate);
+    candidate_owned = false;
     try ctx.out.print("{s} {s} -> {s}/{s}\n", .{
         @tagName(outcome),
         link_abs,
@@ -443,7 +543,7 @@ pub fn unlink(ctx: *Context, raw_paths: anytype, skill_name: ?[]const u8) !bool 
     if ((skill_name == null and raw_paths.len == 0) or (skill_name != null and raw_paths.len != 0)) {
         return error.Usage;
     }
-    var lock_file = try paths_mod.lock(ctx.io, ctx.root_dir);
+    var lock_file = try paths_mod.lock(ctx.io, ctx.rootDir());
     defer lock_file.close(ctx.io);
     try ctx.reload();
 
@@ -481,7 +581,8 @@ fn unlinkOne(ctx: *Context, raw: []const u8) !void {
     const registered = hasLocalEntry(ctx, link_path);
 
     var candidate = try cloneRegistry(ctx.a, ctx.registry);
-    errdefer candidate.deinit(ctx.a);
+    var candidate_owned = true;
+    errdefer if (candidate_owned) candidate.deinit(ctx.a);
     _ = try candidate.remove(ctx.a, link_path, ctx.host);
     const registry_bytes = try candidate.encode(ctx.a);
     defer ctx.a.free(registry_bytes);
@@ -490,17 +591,27 @@ fn unlinkOne(ctx: *Context, raw: []const u8) !void {
     var dir = std.Io.Dir.openDirAbsolute(ctx.io, parent, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
             if (!registered) return err;
-            try Registry.saveBytes(ctx.io, ctx.root_dir, registry_bytes);
+            // The whole project is gone; no filesystem mutation happens, so
+            // ordering is irrelevant here.
+            try Registry.saveBytes(ctx.io, ctx.rootDir(), registry_bytes);
             replaceRegistry(ctx, candidate);
+            candidate_owned = false;
             try ctx.out.print("absent {s}\n", .{link_path});
             return;
         },
         else => return err,
     };
     defer dir.close(ctx.io);
+
+    // Failure atomicity: flush the registry bytes before removing the link;
+    // only the atomic rename remains after the filesystem mutation.
+    var prepared = try Registry.PreparedSave.prepare(ctx.io, ctx.rootDir(), registry_bytes);
+    errdefer prepared.deinit(ctx.io);
     const outcome = try symlink.unlink(ctx.io, dir, std.fs.path.basename(link_path), ctx.sources_real);
-    try Registry.saveBytes(ctx.io, ctx.root_dir, registry_bytes);
+    try failAt(.before_registry_commit);
+    try prepared.commit(ctx.io);
     replaceRegistry(ctx, candidate);
+    candidate_owned = false;
     try ctx.out.print("{s} {s}\n", .{ @tagName(outcome), link_path });
 }
 
@@ -628,10 +739,10 @@ fn hasLocalEntry(ctx: *const Context, path: []const u8) bool {
 }
 
 fn sweepCloneTemps(ctx: *Context) !void {
-    var it = ctx.sources_dir.iterate();
+    var it = ctx.sourcesDir().iterate();
     while (try it.next(ctx.io)) |entry| {
         if (!std.mem.startsWith(u8, entry.name, ".tmp-")) continue;
-        try ctx.sources_dir.deleteTree(ctx.io, entry.name);
+        try ctx.sourcesDir().deleteTree(ctx.io, entry.name);
     }
 }
 
@@ -646,9 +757,9 @@ fn injectBeforeConfigSave(point: FaultPoint) bool {
 fn expectNoCloneTrace(ctx: *Context, source_name: []const u8) !void {
     try std.testing.expectError(
         error.FileNotFound,
-        ctx.sources_dir.access(ctx.io, source_name, .{ .follow_symlinks = false }),
+        ctx.sourcesDir().access(ctx.io, source_name, .{ .follow_symlinks = false }),
     );
-    var it = ctx.sources_dir.iterate();
+    var it = ctx.sourcesDir().iterate();
     while (try it.next(ctx.io)) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".tmp-"));
     }
@@ -751,6 +862,186 @@ test "linkOne leaves no half-state under every OOM (a: exhaustive allocation fai
     );
 }
 
+// Failure atomicity: a registry commit failure after the link lands leaves
+// the link on disk, the registry untouched and no temp file in the managed
+// root; re-running the same link converges (atomic visibility residue).
+test "link commit failure is reported and a re-run converges (a: fault injection)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    try t.dir.createDirPath(io, "managed/sources/central/zig");
+    try t.dir.writeFile(io, .{ .sub_path = "managed/sources/central/zig/SKILL.md", .data = "v1\n" });
+    try t.dir.createDirPath(io, "dest");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try t.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const managed = try std.fs.path.join(a, &.{ root, "managed" });
+    defer a.free(managed);
+    const dest = try std.fs.path.join(a, &.{ root, "dest" });
+    defer a.free(dest);
+    const skill_abs = try std.fs.path.join(a, &.{ managed, "sources/central/zig" });
+    defer a.free(skill_abs);
+    const link_abs = try std.fs.path.join(a, &.{ dest, "zig" });
+    defer a.free(link_abs);
+    const links_json = try std.fs.path.join(a, &.{ managed, "links.json" });
+    defer a.free(links_json);
+    const skill = discovery.Skill{
+        .name = "zig",
+        .source = "central",
+        .rel_path = "zig",
+        .abs_path = skill_abs,
+    };
+
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", root);
+    var out_buf: [1024]u8 = undefined;
+    var out = std.Io.Writer.fixed(&out_buf);
+    var err_buf: [1024]u8 = undefined;
+    var err = std.Io.Writer.fixed(&err_buf);
+    var ctx = try Context.init(a, io, &env, managed, &out, &err);
+    defer ctx.deinit();
+
+    fault = injectBeforeRegistryCommit;
+    defer fault = null;
+    try std.testing.expectError(
+        error.FaultInjected,
+        linkOne(&ctx, skill, "zig", dest, .{ .no_exclude = true }),
+    );
+
+    // The link landed but nothing else did: no registry file, no entry, and
+    // no leftover temp file in the managed root (the prepared save was
+    // discarded).
+    try std.Io.Dir.accessAbsolute(io, link_abs, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(@as(usize, 0), ctx.registry.links.len);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, links_json, .{}));
+    {
+        var root_iter = try std.Io.Dir.openDirAbsolute(io, managed, .{ .iterate = true });
+        defer root_iter.close(io);
+        var it = root_iter.iterate();
+        while (try it.next(io)) |entry| {
+            try std.testing.expectEqualStrings("sources", entry.name);
+        }
+    }
+
+    // Recovery: the same link command converges — `unchanged` on disk,
+    // registered in the file — and a third run is a full no-op.
+    fault = null;
+    const unchanged_line = try std.fmt.allocPrint(a, "unchanged {s} -> central/zig\n", .{link_abs});
+    defer a.free(unchanged_line);
+    out = std.Io.Writer.fixed(&out_buf);
+    ctx.out = &out;
+    try linkOne(&ctx, skill, "zig", dest, .{ .no_exclude = true });
+    try std.testing.expectEqual(@as(usize, 1), ctx.registry.links.len);
+    try std.Io.Dir.accessAbsolute(io, links_json, .{});
+    try std.testing.expectEqualStrings(unchanged_line, out.buffered());
+
+    out = std.Io.Writer.fixed(&out_buf);
+    ctx.out = &out;
+    try linkOne(&ctx, skill, "zig", dest, .{ .no_exclude = true });
+    try std.testing.expectEqualStrings(unchanged_line, out.buffered());
+    try std.testing.expectEqual(@as(usize, 1), ctx.registry.links.len);
+}
+
+fn injectBeforeRegistryCommit(point: FaultPoint) bool {
+    return point == .before_registry_commit;
+}
+
+fn injectBeforeRegistrySave(point: FaultPoint) bool {
+    return point == .before_registry_save;
+}
+
+// Repair convergence: a source-sync interrupted before the registry save
+// leaves links repaired on disk but the registry stale; the next sync adopts
+// reality (no relink) and everything reads `ok` again (failure atomicity
+// residue; repair preserves identity).
+test "source-sync interrupted before the registry save converges on re-run (a: fault injection)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    var libgit = try git.fixtures.Libgit2.init();
+    defer libgit.deinit();
+    const origin = try git.fixtures.initOrigin(a, io, t.dir, "origin");
+    defer a.free(origin);
+    try git.fixtures.commitFile(io, origin, "zig/SKILL.md", "v1\n");
+    try t.dir.createDirPath(io, "dest");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try t.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const ugarit_home = try std.fs.path.join(a, &.{ root, "home" });
+    defer a.free(ugarit_home);
+    const dest = try std.fs.path.join(a, &.{ root, "dest" });
+    defer a.free(dest);
+    const skill_abs = try std.fs.path.join(a, &.{ ugarit_home, "sources/central/zig" });
+    defer a.free(skill_abs);
+    const link_abs = try std.fs.path.join(a, &.{ dest, "zig" });
+    defer a.free(link_abs);
+    const links_json = try std.fs.path.join(a, &.{ ugarit_home, "links.json" });
+    defer a.free(links_json);
+    const skill = discovery.Skill{
+        .name = "zig",
+        .source = "central",
+        .rel_path = "zig",
+        .abs_path = skill_abs,
+    };
+
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", root);
+    var out_buf: [8192]u8 = undefined;
+    var out = std.Io.Writer.fixed(&out_buf);
+    var err_buf: [8192]u8 = undefined;
+    var err = std.Io.Writer.fixed(&err_buf);
+    var ctx = try Context.init(a, io, &env, ugarit_home, &out, &err);
+    defer ctx.deinit();
+
+    try sourceAdd(&ctx, origin, .{ .name = "central" });
+    try linkOne(&ctx, skill, "zig", dest, .{ .no_exclude = true });
+
+    // Upstream moves the skill; the interrupted sync repairs the disk link
+    // but never persists the registry.
+    try git.fixtures.moveFile(io, origin, "zig/SKILL.md", "lang/zig/SKILL.md");
+    fault = injectBeforeRegistrySave;
+    try std.testing.expectError(error.FaultInjected, sourceSync(&ctx, null));
+    {
+        var dest_dir = try std.Io.Dir.openDirAbsolute(io, dest, .{});
+        defer dest_dir.close(io);
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = try dest_dir.readLink(io, "zig", &buf);
+        try std.testing.expect(std.mem.endsWith(u8, buf[0..n], "/central/lang/zig"));
+    }
+    const stale = try std.Io.Dir.cwd().readFileAlloc(io, links_json, a, .limited(1 << 20));
+    defer a.free(stale);
+    try std.testing.expect(std.mem.indexOf(u8, stale, "\"rel_path\":\"zig\"") != null);
+
+    // The re-run adopts the already-repaired link (no relink, one report).
+    fault = null;
+    out = std.Io.Writer.fixed(&out_buf);
+    ctx.out = &out;
+    try std.testing.expect(try sourceSync(&ctx, null));
+    try std.testing.expectStringStartsWith(out.buffered(), "central  up-to-date\nrepaired ");
+    try std.testing.expectEqual(@as(usize, 1), ctx.registry.links.len);
+    try std.testing.expectEqualStrings("lang/zig", ctx.registry.links[0].rel_path);
+    try std.testing.expectEqual(
+        registry_mod.State.ok,
+        try registry_mod.status(io, ctx.registry.links[0], ctx.sources_real),
+    );
+    const converged = try std.Io.Dir.cwd().readFileAlloc(io, links_json, a, .limited(1 << 20));
+    defer a.free(converged);
+    try std.testing.expect(std.mem.indexOf(u8, converged, "\"rel_path\":\"lang/zig\"") != null);
+
+    // A third sync is a full no-op.
+    out = std.Io.Writer.fixed(&out_buf);
+    ctx.out = &out;
+    try std.testing.expect(try sourceSync(&ctx, null));
+    try std.testing.expectEqualStrings("central  up-to-date\n", out.buffered());
+    try std.testing.expectEqualStrings("lang/zig", ctx.registry.links[0].rel_path);
+}
+
 // Failure atomicity: an injected fault after the clone (or before the config
 // save) must leave config bytes unchanged and no `.tmp-*` clone trace behind.
 test "source-add failures preserve config and leave no clone trace (a: fault injection)" {
@@ -778,7 +1069,7 @@ test "source-add failures preserve config and leave no clone trace (a: fault inj
     var ctx = try Context.init(a, io, &env, ugarit_home, &out, &err);
     defer ctx.deinit();
     const original = "{\"version\":1,\"sources\":[]}";
-    try ctx.root_dir.writeFile(io, .{ .sub_path = "config.json", .data = original });
+    try ctx.root_dir.?.writeFile(io, .{ .sub_path = "config.json", .data = original });
 
     git.fault = injectGitAfterClone;
     defer git.fault = null;
@@ -787,7 +1078,7 @@ test "source-add failures preserve config and leave no clone trace (a: fault inj
         sourceAdd(&ctx, origin, .{ .name = "central" }),
     );
     try expectNoCloneTrace(&ctx, "central");
-    var bytes = try ctx.root_dir.readFileAlloc(io, "config.json", a, .limited(1024));
+    var bytes = try ctx.root_dir.?.readFileAlloc(io, "config.json", a, .limited(1024));
     defer a.free(bytes);
     try std.testing.expectEqualStrings(original, bytes);
 
@@ -800,7 +1091,7 @@ test "source-add failures preserve config and leave no clone trace (a: fault inj
     );
     try expectNoCloneTrace(&ctx, "central");
     a.free(bytes);
-    bytes = try ctx.root_dir.readFileAlloc(io, "config.json", a, .limited(1024));
+    bytes = try ctx.root_dir.?.readFileAlloc(io, "config.json", a, .limited(1024));
     try std.testing.expectEqualStrings(original, bytes);
 
     fault = null;
@@ -810,7 +1101,7 @@ test "source-add failures preserve config and leave no clone trace (a: fault inj
     if (sourceAdd(&ctx, origin, .{ .name = "central" })) |_| {
         return error.ExpectedWriteFailure;
     } else |_| {}
-    try ctx.sources_dir.access(io, "central", .{});
+    try ctx.sources_dir.?.access(io, "central", .{});
     try ctx.reload();
     try std.testing.expect(ctx.cfg.find("central") != null);
 }
@@ -835,8 +1126,8 @@ test "link --mkdir rejects a destination inside sources before creation (a: pinn
     var err = std.Io.Writer.fixed(&err_buf);
     var ctx = try Context.init(a, io, &env, managed, &out, &err);
     defer ctx.deinit();
-    try ctx.sources_dir.createDirPath(io, "central/zig");
-    try ctx.sources_dir.writeFile(io, .{ .sub_path = "central/zig/SKILL.md", .data = "v1\n" });
+    try ctx.sources_dir.?.createDirPath(io, "central/zig");
+    try ctx.sources_dir.?.writeFile(io, .{ .sub_path = "central/zig/SKILL.md", .data = "v1\n" });
     const skill_abs = try std.fs.path.join(a, &.{ ctx.sources_real, "central/zig" });
     defer a.free(skill_abs);
     const rejected = try std.fs.path.join(a, &.{ skill_abs, "nested/dest" });
@@ -864,4 +1155,73 @@ test "diagnostic table covers every category (b: exhaustive CLI contract)" {
         const code = diagnosticExitCode(kind);
         try std.testing.expect(code == 1 or code == 2);
     }
+}
+
+// Read-only purity: `list` never creates the managed root or sources
+// directory, whether both are missing, only the root exists, or both exist.
+test "read-only list creates no directories (c: un-generatable, absent-tree states)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try t.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", root);
+    var out_buf: [4096]u8 = undefined;
+    var out = std.Io.Writer.fixed(&out_buf);
+    var err_buf: [4096]u8 = undefined;
+    var err = std.Io.Writer.fixed(&err_buf);
+
+    // Case 1: nothing exists yet — defaults, no warnings, nothing created.
+    {
+        var ctx = try Context.initReadOnly(a, io, &env, null, &out, &err);
+        defer ctx.deinit();
+        try list(&ctx, null, .{});
+        try std.testing.expect(ctx.root_dir == null);
+        try std.testing.expect(ctx.sources_dir == null);
+        try std.testing.expectEqual(@as(usize, 0), ctx.registry.links.len);
+    }
+    const case1_root = try std.fs.path.join(a, &.{ root, ".config/ugarit" });
+    defer a.free(case1_root);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.accessAbsolute(io, case1_root, .{ .follow_symlinks = false }),
+    );
+
+    // Case 2: root exists with a config, sources missing — per-source warning.
+    try t.dir.createDirPath(io, "home/.config/ugarit");
+    try t.dir.writeFile(io, .{
+        .sub_path = "home/.config/ugarit/config.json",
+        .data = "{\"version\":1,\"sources\":[{\"name\":\"central\",\"url\":\"/unused\"}]}",
+    });
+    const home = try std.fs.path.join(a, &.{ root, "home" });
+    defer a.free(home);
+    try env.put("HOME", home);
+    {
+        var ctx = try Context.initReadOnly(a, io, &env, null, &out, &err);
+        defer ctx.deinit();
+        try list(&ctx, null, .{});
+        try std.testing.expect(ctx.root_dir != null);
+        try std.testing.expect(ctx.sources_dir == null);
+    }
+    const case2_sources = try std.fs.path.join(a, &.{ home, ".config/ugarit/sources" });
+    defer a.free(case2_sources);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.accessAbsolute(io, case2_sources, .{ .follow_symlinks = false }),
+    );
+
+    // Mutating init still creates both, and list over a real tree works.
+    {
+        var ctx = try Context.init(a, io, &env, null, &out, &err);
+        defer ctx.deinit();
+        try std.testing.expect(ctx.root_dir != null);
+        try std.testing.expect(ctx.sources_dir != null);
+        try list(&ctx, null, .{});
+    }
+    try std.Io.Dir.accessAbsolute(io, case2_sources, .{ .follow_symlinks = false });
 }

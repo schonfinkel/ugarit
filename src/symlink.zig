@@ -210,8 +210,23 @@ fn isReservedTemp(name: []const u8) bool {
 
 // --- git exclude integration --------------------------------------------------
 
+/// What `excludeInEnclosingRepo` appended, so a caller whose link later
+/// failed can put the file back byte-exactly (exclude idempotence).
+pub const Exclusion = struct {
+    /// The appended line, without its trailing newline (owned by the caller's
+    /// allocator; e.g. `"/.claude/skills/zig"`).
+    line: []const u8,
+    /// True when the append also inserted a newline separator because the
+    /// file did not end with one.
+    added_separator: bool,
+    /// True when this call created `info/exclude`, so rollback can remove an
+    /// otherwise-empty file instead of leaving filesystem residue.
+    created_file: bool,
+};
+
 pub const ExcludeOutcome = union(enum) {
-    excluded,
+    /// This call appended the line; the payload describes the exact change.
+    excluded: Exclusion,
     not_a_repo,
     /// Already ignored by that repo (`.gitignore` or a previous run).
     already,
@@ -256,8 +271,12 @@ pub fn excludeInEnclosingRepo(
     defer info.close(io);
 
     // existing content (exclude idempotence double guard: skip if the line is already there)
+    var created_file = false;
     const existing = info.readFileAlloc(io, "exclude", a, .limited(1 << 20)) catch |e| switch (e) {
-        error.FileNotFound => try a.dupe(u8, ""),
+        error.FileNotFound => blk: {
+            created_file = true;
+            break :blk try a.dupe(u8, "");
+        },
         else => return e,
     };
     defer a.free(existing);
@@ -271,12 +290,74 @@ pub fn excludeInEnclosingRepo(
     var wbuf: [4096]u8 = undefined;
     var w = af.file.writer(io, &wbuf);
     try w.interface.writeAll(existing);
-    if (existing.len != 0 and existing[existing.len - 1] != '\n') try w.interface.writeAll("\n");
+    const added_separator = existing.len != 0 and existing[existing.len - 1] != '\n';
+    if (added_separator) try w.interface.writeAll("\n");
     try w.interface.writeAll(pattern);
     try w.interface.writeAll("\n");
     try w.flush();
     try af.replace(io);
-    return .excluded;
+    return .{ .excluded = .{
+        .line = try a.dupe(u8, pattern),
+        .added_separator = added_separator,
+        .created_file = created_file,
+    } };
+}
+
+/// Puts `info/exclude` back after `exclusion` was appended and the link it
+/// was appended for failed: strips the trailing line byte-exactly, atomically.
+/// No-op when the file no longer ends with that line (someone else edited it)
+/// or no enclosing repo exists (exclude idempotence; best-effort by design —
+/// callers swallow errors because a leftover line is benign).
+pub fn revertExcludeLine(
+    a: std.mem.Allocator,
+    io: std.Io,
+    link_abs: []const u8,
+    exclusion: Exclusion,
+) !void {
+    const repo_dir = (try git.discoverRepo(a, link_abs)) orelse return;
+    defer a.free(repo_dir);
+
+    const commondir = try git.repoCommondir(a, repo_dir);
+    defer a.free(commondir);
+    const common = commondir[0 .. commondir.len - 1];
+
+    var git_dir = try std.Io.Dir.openDirAbsolute(io, common, .{});
+    defer git_dir.close(io);
+    var info = git_dir.openDir(io, "info", .{}) catch |e| switch (e) {
+        error.FileNotFound => return, // info/ never existed: nothing was appended
+        else => return e,
+    };
+    defer info.close(io);
+    const current = info.readFileAlloc(io, "exclude", a, .limited(1 << 20)) catch |e| switch (e) {
+        error.FileNotFound => return,
+        else => return e,
+    };
+    defer a.free(current);
+
+    // The append was `existing ++ [sep] ++ line ++ "\n"` at end of file; undo
+    // exactly that. Anything else at the tail means the file changed since.
+    var end = current.len;
+    if (end == 0 or current[end - 1] != '\n') return;
+    end -= 1;
+    if (!std.mem.endsWith(u8, current[0..end], exclusion.line)) return;
+    end -= exclusion.line.len;
+    if (exclusion.added_separator) {
+        if (end == 0 or current[end - 1] != '\n') return;
+        end -= 1;
+    }
+
+    if (exclusion.created_file and end == 0) {
+        try info.deleteFile(io, "exclude");
+        return;
+    }
+
+    var af = try info.createFileAtomic(io, "exclude", .{ .replace = true });
+    defer af.deinit(io);
+    var wbuf: [4096]u8 = undefined;
+    var w = af.file.writer(io, &wbuf);
+    try w.interface.writeAll(current[0..end]);
+    try w.flush();
+    try af.replace(io);
 }
 
 test "link surfaces EACCES and leaves no temp (c: un-generatable, permissions)" {

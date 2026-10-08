@@ -154,3 +154,30 @@ test "binary usage errors exit two" {
     defer result.deinit(a);
     try expectExit(2, result);
 }
+
+test "binary list on a fresh home creates nothing" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const exe_ptr = getenv("UGARIT_EXE") orelse return error.MissingUgaritExe;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    try t.dir.createDirPath(io, "home");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try t.dir.realPath(io, &root_buf);
+    const home = try std.fs.path.join(a, &.{ root_buf[0..root_len], "home" });
+    defer a.free(home);
+    const fresh = try std.fs.path.join(a, &.{ home, ".config/ugarit" });
+    defer a.free(fresh);
+
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    const result = try run(a, io, std.mem.span(exe_ptr), &env, &.{"list"});
+    defer result.deinit(a);
+    try expectExit(0, result);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.accessAbsolute(io, fresh, .{ .follow_symlinks = false }),
+    );
+}

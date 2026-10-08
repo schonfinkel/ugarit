@@ -104,17 +104,18 @@ Each property is a property test that states its claim over generated inputs. Th
 
 | Property | Claim | Owner module | Invariants |
 |---|---|---|---|
-| `P1` command state machine | Random link/unlink/tamper sequences preserve filesystem + registry invariants after every step. | `src/test/props.zig` | no-collateral-damage, ownership, atomic-visibility, confinement, fan-out, idempotence, inverse, soundness, completeness, repair, exit-status |
+| `P1` command state machine | Random link/unlink/tamper sequences preserve destination ownership and in-memory registry agreement after every step. | `src/test/props.zig` | no-collateral-damage, ownership, idempotence, inverse, soundness |
 | `P2` URL round-trip | `extractRepoName` recovers the name from every URL form. | `config` | `extractRepoName` totality |
 | `P2b` URL near-miss robustness | Near-miss/garbage URLs yield a valid name or an error, never a crash. | `config` | `extractRepoName` totality |
 | `P3` validateName agreement | `validateName` agrees with an independently written name spec. | `config` | `extractRepoName` totality |
 | `P3b` validateName boundaries | Boundary classes (empty, `.`, `..`, length, chars) classify correctly. | `config` | `extractRepoName` totality |
-| `P4` config identity | Save→load is the identity; truncated/garbage bytes → error, never a partial config. | `config` | failure-atomicity, config-well-formedness |
+| `P4` config identity | Save→load is the identity; every proper truncation and representative invalid schema is rejected. | `config` | failure-atomicity, config-well-formedness |
 | `P5` tilde + canonical-destination | Output is absolute, `..`-free, symlink-resolving, and idempotent. | `paths` | soundness (and `PL1`, `PL2`) |
 | `P6` discovery on random trees | Sorted, confined, no symlink traversal, collisions case-folded. | `discovery` | discovery-determinism, confinement |
 | `P7` classify × link decision table | Real entries survive; the outcome matches the table for every pre-state × force. | `symlink` | ownership, idempotence |
 | `P8` interrupted link | Fault after temp creation → dest unchanged, no temp left. | `symlink` | atomic-visibility |
 | `P9` exclude idempotence | N calls append at most one line; never writes outside `commondir/info/`. | `symlink` | exclude-idempotence, no-collateral-damage |
+| failed repo link rollback | A faulting link restores both the destination and `info/exclude` exactly; retry converges. | `src/test/props.zig` | failure-atomicity, atomic-visibility, exclude-idempotence |
 | `P10` sync respects local state | On random local states, only clean + fast-forward changes anything. | `git` | no-lost-work |
 | `P11` source-add clone failure | Injected clone failure leaves config bytes unchanged. | `main`/`config` | failure-atomicity |
 | `P12` repair on upstream moves | Relinks only on a unique same-name match; else reports dangling. | `Registry` | repair-preserves-identity, confinement |
@@ -124,7 +125,7 @@ Each property is a property test that states its claim over generated inputs. Th
 
 ## Failure injection
 
-`P8` and `P11` use a comptime-disabled `Fault` hook (compiled in only under `builtin.is_test`) at named points: `after_tmp_symlink`, `before_rename`, `after_clone`, `before_config_save`.
+Fault hooks compile only under `builtin.is_test`. Symlink tests inject at `after_tmp_symlink` and `before_rename`; application transaction tests inject at `before_config_save`, `before_registry_commit`, and `before_registry_save`.
 
 ## Unit-test classes
 
