@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const static = b.option(bool, "static", "Link libgit2 and its dependencies statically") orelse false;
 
     // libgit2 bindings via translate-c; include/link paths resolve through pkg-config
     const translate = b.addTranslateC(.{
@@ -13,6 +14,11 @@ pub fn build(b: *std.Build) void {
     translate.linkSystemLibrary("git2", .{});
     const git2 = translate.createModule();
     git2.linkSystemLibrary("git2", .{});
+    if (static) {
+        for ([_][]const u8{ "llhttp", "rt", "ssl", "crypto", "pcre2-8", "ssh2", "z" }) |lib| {
+            git2.linkSystemLibrary(lib, .{});
+        }
+    }
 
     const serde_mod = b.dependency("serde", .{
         .target = target,

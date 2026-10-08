@@ -39,6 +39,10 @@
         { pkgs, lib, ... }:
         let
           zigVersion = pkgs.zig_0_16;
+          zigDependencies = pkgs.callPackage ./build.zig.zon.nix { };
+          staticTarget =
+            lib.replaceStrings [ "-unknown-" ] [ "-" ]
+              pkgs.pkgsStatic.stdenv.hostPlatform.config;
 
           toolPackages = with pkgs; [
             libgit2
@@ -69,20 +73,78 @@
           };
 
           # Hermetic build: Zig packages come from the generated linkFarm, not the network.
-          packages.default = pkgs.stdenv.mkDerivation {
-            pname = "ugarit";
+          packages = {
+            default = pkgs.stdenv.mkDerivation {
+              pname = "ugarit";
+              version = "0.1.0";
+              src = ./.;
+              nativeBuildInputs = [
+                zigVersion.hook
+                pkgs.pkg-config
+              ];
+              buildInputs = [ pkgs.libgit2 ];
+              zigBuildFlags = [
+                "--system"
+                (builtins.toString zigDependencies)
+                "-Doptimize=ReleaseSafe"
+              ];
+            };
+          }
+          // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            static = pkgs.pkgsStatic.stdenv.mkDerivation {
+              pname = "ugarit-static";
+              version = "0.1.0";
+              src = ./.;
+              nativeBuildInputs = [
+                zigVersion
+                pkgs.pkg-config
+              ];
+              buildInputs = [ pkgs.pkgsStatic.libgit2 ];
+              dontConfigure = true;
+              buildPhase = ''
+                runHook preBuild
+                export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
+                zig build \
+                  --system ${zigDependencies} \
+                  -Dtarget=${staticTarget} \
+                  -Dstatic=true \
+                  -Doptimize=ReleaseSafe
+                runHook postBuild
+              '';
+              installPhase = ''
+                runHook preInstall
+                install -Dm755 zig-out/bin/ugarit "$out/bin/ugarit"
+                runHook postInstall
+              '';
+            };
+          };
+
+          checks.default = pkgs.stdenv.mkDerivation {
+            pname = "ugarit-check";
             version = "0.1.0";
             src = ./.;
             nativeBuildInputs = [
-              zigVersion.hook
+              zigVersion
               pkgs.pkg-config
             ];
             buildInputs = [ pkgs.libgit2 ];
-            zigBuildFlags = [
-              "--system"
-              (builtins.toString (pkgs.callPackage ./build.zig.zon.nix { }))
-              "-Doptimize=ReleaseSafe"
-            ];
+            dontConfigure = true;
+            buildPhase = ''
+              runHook preBuild
+              export HOME="$TMPDIR/home"
+              export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
+              mkdir -p "$HOME"
+              zig build test \
+                --system ${zigDependencies} \
+                -Doptimize=ReleaseSafe \
+                --summary all
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              touch "$out"
+              runHook postInstall
+            '';
           };
 
           # Bare minimum for CI. `nix develop .#ci`
