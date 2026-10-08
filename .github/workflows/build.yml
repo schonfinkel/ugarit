@@ -1,0 +1,41 @@
+name: "[Nix] Build and Test"
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  nix:
+    name: "[Nix] Build and Test"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: nixbuild/nix-quick-install-action@v30
+        with:
+          nix_conf: |
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '**/*.nix', 'build.zig', 'build.zig.zon') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 5G
+
+      - name: Check flake
+        run: nix flake check --print-build-logs
+
+      - name: Build default package
+        run: nix build .#default --no-link --print-build-logs
+
+      - name: Build static package
+        run: nix build .#static --no-link --print-build-logs
