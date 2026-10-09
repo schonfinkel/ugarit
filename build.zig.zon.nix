@@ -10,8 +10,10 @@
 linkFarm "zig-packages" [
   {
     name = "N-V-__8AAFrtpQI1j9eOv7aN3lt3eH1TJfH4npAdRIrg2gGH";
-    path = fetchzip {
-      url = "https://codeload.github.com/Mbed-TLS/mbedtls/tar.gz/refs/tags/v3.6.0";
+    path = fetchFromGitHub {
+      owner = "Mbed-TLS";
+      repo = "mbedtls";
+      rev = "v3.6.0";
       hash = "sha256-yzGBkrqh+T/5GS66xL5zJstCmvcfG09TfxqA3F8UPJg=";
     };
   }
