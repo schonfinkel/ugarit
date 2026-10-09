@@ -22,6 +22,12 @@ make
 ./zig-out/bin/ugarit --version
 ```
 
+After changing `build.zig.zon`, regenerate and commit the Nix dependency lock:
+
+```sh
+nix run .#zig2nix -- zon2lock build.zig.zon
+```
+
 Register a skill repository, inspect its skills, and link one:
 
 ```sh
