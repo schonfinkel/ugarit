@@ -25,6 +25,10 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
+      # zig2nix uses bubblewrap while building its Zig helper.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Restore and save Nix store
         uses: nix-community/cache-nix-action@v7
         with:
