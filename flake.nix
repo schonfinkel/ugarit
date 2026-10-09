@@ -2,7 +2,7 @@
   description = "Ugarit Development shell";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst";
 
     flake-parts.url = "github:hercules-ci/flake-parts";
 
@@ -12,6 +12,11 @@
     };
 
     treefmt-nix.url = "github:numtide/treefmt-nix";
+
+    zig2nix = {
+      url = "github:Cloudef/zig2nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     nix2container = {
       url = "github:nlewo/nix2container";
@@ -36,7 +41,12 @@
       systems = nixpkgs.lib.systems.flakeExposed;
 
       perSystem =
-        { pkgs, lib, ... }:
+        {
+          pkgs,
+          lib,
+          system,
+          ...
+        }:
         let
           zonVersionPattern = ''[[:space:]]*\.version[[:space:]]*=[[:space:]]*"([^"]+)"[[:space:]]*,[[:space:]]*'';
           zonVersionMatches = builtins.filter (match: match != null) (
@@ -51,7 +61,14 @@
               throw "build.zig.zon must contain exactly one .version = \"...\", line";
 
           zigVersion = pkgs.zig_0_16;
-          zigDependencies = pkgs.callPackage ./build.zig.zon.nix { };
+          zig2nixEnv = inputs.zig2nix.outputs.zig-env.${system} {
+            nixpkgs = inputs.nixpkgs;
+            zig = zigVersion;
+          };
+          zigDependencies = zig2nixEnv.deriveLockFile ./build.zig.zon2json-lock {
+            zig = zigVersion;
+            name = "ugarit-dependencies";
+          };
           staticTarget =
             lib.replaceStrings [ "-unknown-" ] [ "-" ]
               pkgs.pkgsStatic.stdenv.hostPlatform.config;
@@ -60,7 +77,7 @@
             libgit2
             pkg-config
             git
-            zon2nix
+            zig2nixEnv.zig2nix
           ];
 
           # devenv wants an absolute path to the project root and cannot
@@ -84,8 +101,10 @@
             };
           };
 
-          # Hermetic build: Zig packages come from the generated linkFarm, not the network.
+          # Hermetic build: Zig packages come from the generated package cache, not the network.
           packages = {
+            zig2nix = zig2nixEnv.zig2nix;
+
             default = pkgs.stdenv.mkDerivation {
               pname = "ugarit";
               inherit version;
@@ -95,11 +114,10 @@
                 pkgs.pkg-config
               ];
               buildInputs = [ pkgs.libgit2 ];
-              zigBuildFlags = [
-                "--system"
-                (builtins.toString zigDependencies)
-                "-Doptimize=ReleaseSafe"
-              ];
+              postConfigure = ''
+                ln -s ${zigDependencies} "$ZIG_GLOBAL_CACHE_DIR/p"
+              '';
+              zigBuildFlags = [ "-Doptimize=ReleaseSafe" ];
             };
           }
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
@@ -116,8 +134,9 @@
               buildPhase = ''
                 runHook preBuild
                 export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
+                mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+                ln -s ${zigDependencies} "$ZIG_GLOBAL_CACHE_DIR/p"
                 zig build \
-                  --system ${zigDependencies} \
                   -Dtarget=${staticTarget} \
                   -Dstatic=true \
                   -Doptimize=ReleaseSafe
@@ -145,9 +164,9 @@
               runHook preBuild
               export HOME="$TMPDIR/home"
               export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-cache"
-              mkdir -p "$HOME"
+              mkdir -p "$HOME" "$ZIG_GLOBAL_CACHE_DIR"
+              ln -s ${zigDependencies} "$ZIG_GLOBAL_CACHE_DIR/p"
               zig build test \
-                --system ${zigDependencies} \
                 -Doptimize=ReleaseSafe \
                 --summary all
               runHook postBuild

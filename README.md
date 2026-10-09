@@ -1,6 +1,7 @@
 # Ugarit
 
-[![built with nix](https://builtwithnix.org/badge.svg)](https://builtwithnix.org)
+[![Built with Nix](https://builtwithnix.org/badge.svg)](https://builtwithnix.org)
+[![\[Nix\] Build and Test](https://github.com/schonfinkel/ugarit/actions/workflows/build.yml/badge.svg)](https://github.com/schonfinkel/ugarit/actions/workflows/build.yml)
 
 Ugarit is a small CLI for discovering skills in Git repositories and linking them into the directories used by coding agents. It keeps one managed clone of each source, records links per host, and repairs links after upstream moves.
 
@@ -19,6 +20,12 @@ Or enter the development shell and build with Zig 0.16:
 nix develop --impure
 make
 ./zig-out/bin/ugarit --version
+```
+
+After changing `build.zig.zon`, regenerate and commit the Nix dependency lock:
+
+```sh
+nix run .#zig2nix -- zon2lock build.zig.zon
 ```
 
 Register a skill repository, inspect its skills, and link one:
