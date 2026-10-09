@@ -1,0 +1,37 @@
+{
+  "serde-1.2.2-1DszTxNsGQB0pwXk4nyJcSPq0_Z2XLXrZY0ISwq5nARW": {
+    "name": "serde",
+    "url": "git+https://github.com/OrlovEvgeny/serde.zig?ref=v1.2.2#b378c4c7392c0eead087000e455e3b108b4b590f",
+    "hash": "sha256-Z6Gbhwc9h07MnSbJ6xbJrcESonlTEYSveRBl+Gi1E50="
+  },
+  "zigcli-0.6.3-ORC7jEq5BgBpghsTghUfiIZf0vurICzhJtJZOVXPbLZr": {
+    "name": "zigcli",
+    "url": "git+https://github.com/jiacai2050/zigcli?ref=v0.6.3#91d9f7fc505ac522f868fac882bc7bf87410f487",
+    "hash": "sha256-2S7lI1pJNOCDTF8wNgYO6qb1TMkwPuSKtzqSNhZkRmA="
+  },
+  "curl-0.5.1-P4tT4T4AAQAWgbb1Iwh00q9raBCW4ZphsAkFh2U5oQ6X": {
+    "name": "curl",
+    "url": "https://github.com/jiacai2050/zig-curl/archive/refs/tags/v0.5.1.tar.gz",
+    "hash": "sha256-54r66disBUzQPEiYicMjEFR7EHopv3r2W73ZZU8FwRM="
+  },
+  "N-V-__8AAM-tPgFSsje3FI7iURLjDLSOquhtONinvYZp3AHh": {
+    "name": "curl",
+    "url": "https://github.com/curl/curl/releases/download/curl-8_19_0/curl-8.19.0.tar.gz",
+    "hash": "sha256-zvyUy/GRN1+cki6XiStlgCVi8vEg/Yve5VnZnD4dstw="
+  },
+  "N-V-__8AAJj_QgDBhU17TCtcvdjOZZPDfkvxrEAyZkc14VN8": {
+    "name": "zlib",
+    "url": "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz",
+    "hash": "sha256-ENOklybithyMB8mR/tQ1sqCGI9Oq7kE1b/wCaCEOkF0="
+  },
+  "N-V-__8AAFrtpQI1j9eOv7aN3lt3eH1TJfH4npAdRIrg2gGH": {
+    "name": "mbedtls",
+    "url": "https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v3.6.0.tar.gz",
+    "hash": "sha256-hYGGcn+x+xPF9lNBKP1+W6oXjk0dw5ik6uF0NCE2H7w="
+  },
+  "minish-0.4.0-SQtSTf4pAwD_cAeVB-_rEHWmgovGY-yaCGjX9hpVKxKH": {
+    "name": "minish",
+    "url": "git+https://github.com/CogitatorTech/minish?ref=v0.4.0#dc49fbe5de746c4562379e31d752c31cb804f1d1",
+    "hash": "sha256-Te0qEbCGIOPZkA3pCfS2NzxwxPwzuxW8Gk/wvGy/uyI="
+  }
+}
