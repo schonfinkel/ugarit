@@ -32,7 +32,6 @@ pub const Error = error{
     AmbiguousSkill,
     DestInsideSources,
     DestInsideSkill,
-    DefaultPathNotConfigured,
     InvalidLinkPath,
     FaultInjected,
 };
@@ -45,7 +44,6 @@ pub const Diagnostic = enum {
     ambiguous_skill,
     destination_inside_sources,
     destination_inside_skill,
-    default_path_not_configured,
     invalid_name,
     entry_in_the_way,
     tracked_link_path,
@@ -69,7 +67,6 @@ pub fn diagnostic(err: anyerror) Diagnostic {
         error.AmbiguousSkill => .ambiguous_skill,
         error.DestInsideSources => .destination_inside_sources,
         error.DestInsideSkill => .destination_inside_skill,
-        error.DefaultPathNotConfigured => .default_path_not_configured,
         error.InvalidName => .invalid_name,
         error.RealEntryInTheWay,
         error.ForeignLinkInTheWay,
@@ -85,6 +82,7 @@ pub fn diagnostic(err: anyerror) Diagnostic {
         error.UnsupportedConfigVersion,
         error.UnsupportedRegistryVersion,
         error.DuplicateSourceName,
+        error.InvalidRelPath,
         => .invalid_config,
         error.OutOfMemory => .out_of_memory,
         else => .io,
@@ -100,7 +98,6 @@ pub fn diagnosticMessage(kind: Diagnostic) []const u8 {
         .ambiguous_skill => "skill name is ambiguous; use source/path",
         .destination_inside_sources => "destination is inside ugarit's sources directory",
         .destination_inside_skill => "destination is inside the selected skill",
-        .default_path_not_configured => "no destination provided and default_path is not configured",
         .invalid_name => "invalid name",
         .entry_in_the_way => "destination contains an entry ugarit will not replace",
         .tracked_link_path => "link path is tracked; remove it from the index first",
@@ -125,7 +122,6 @@ pub fn diagnosticExitCode(kind: Diagnostic) u8 {
         .ambiguous_skill,
         .destination_inside_sources,
         .destination_inside_skill,
-        .default_path_not_configured,
         .invalid_name,
         .entry_in_the_way,
         .tracked_link_path,
@@ -454,6 +450,7 @@ pub fn link(
     destinations: anytype,
     options: LinkOptions,
 ) !bool {
+    if (destinations.len == 0) return error.Usage;
     var lock_file = try paths_mod.lock(ctx.io, ctx.rootDir());
     defer lock_file.close(ctx.io);
     try ctx.reload();
@@ -471,15 +468,6 @@ pub fn link(
     };
     const name = options.as orelse skill.name;
     try config.validateName(name);
-
-    if (destinations.len == 0) {
-        const raw = ctx.cfg.value.default_path orelse return error.DefaultPathNotConfigured;
-        linkOne(ctx, skill, name, raw, options) catch |err| {
-            try ctx.report(raw, err);
-            return false;
-        };
-        return true;
-    }
 
     var all_ok = true;
     for (destinations) |raw| {

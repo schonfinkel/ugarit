@@ -36,7 +36,7 @@ const Cli = struct {
         pub const __messages__ = .{
             .@"source-add" = "Register and clone a Git repository source: <url>",
             .@"source-sync" = "Fetch and fast-forward sources, then repair links: [name]",
-            .link = "Symlink a source skill: <source> <skill> [dest-dir...]",
+            .link = "Symlink a source skill: <source> <skill> <dest-dir...>",
             .unlink = "Remove managed links: <link-path>... | --skill <name>",
             .list = "List skills and link status: [skill]",
         };
@@ -152,7 +152,7 @@ fn dispatch(ctx: *ugarit.app.Context, command: @FieldType(Cli, "__commands__"), 
                     return error.Usage;
                 } else try operands.append(ctx.a, arg);
             }
-            if (operands.items.len < 2) return error.Usage;
+            if (operands.items.len < 3) return error.Usage;
             break :blk try ugarit.app.link(ctx, operands.items[0], operands.items[1], operands.items[2..], parsed);
         },
         .unlink => |options| blk: {

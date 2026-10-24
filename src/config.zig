@@ -2,23 +2,48 @@
 //! Invariants (see `src/test/INVARIANTS.md`):
 //! - Failure atomicity: a failed or interrupted save never leaves a partial
 //!   `config.json`; saves are tmp+rename atomic.
-//! - Config well-formedness: source names are unique and valid; `load`
-//!   rejects duplicate names and unknown versions.
+//! - Config well-formedness: names and labels are unique and valid, paths are
+//!   relative and `..`-free; `load` rejects anything else.
 //! - `extractRepoName` totality: round-trips every URL form over valid names,
 //!   and its result always passes `validateName` or errors.
 
 const std = @import("std");
 const serde = @import("serde");
 
+pub const claude_skills_dir = ".claude/skills";
+
 pub const SourceRepo = struct {
     name: []const u8,
+    /// Alias accepted wherever a source name is.
+    label: ?[]const u8 = null,
     url: []const u8,
+    /// Clone subdirectory to scan; overrides `default_search_path`.
+    path: ?[]const u8 = null,
+    /// Destination subdirectory that receives links.
+    target: ?[]const u8 = null,
+    /// Also link into `<dest>/.claude/skills`.
+    claude_sync: bool = true,
     ref: ?[]const u8 = null,
+
+    /// Clone-relative scan root; `""` is the clone itself.
+    pub fn searchPath(self: SourceRepo, cfg: Config) []const u8 {
+        return trimRelPath(self.path orelse cfg.default_search_path orelse "");
+    }
+
+    /// `target` (`""` = dest itself), plus `.claude/skills` under `claude_sync`.
+    pub fn linkSubdirs(self: SourceRepo, buf: *[2][]const u8) []const []const u8 {
+        const target = trimRelPath(self.target orelse "");
+        buf[0] = target;
+        if (!self.claude_sync or std.mem.eql(u8, target, claude_skills_dir)) return buf[0..1];
+        buf[1] = claude_skills_dir;
+        return buf[0..2];
+    }
 };
 
 pub const Config = struct {
     version: u32 = 1,
-    default_path: ?[]const u8 = null,
+    /// Clone subdirectory to scan when a source sets no `path`.
+    default_search_path: ?[]const u8 = null,
     sources: []const SourceRepo = &.{},
 };
 
@@ -31,9 +56,11 @@ pub const ManagedConfig = struct {
         self.arena.deinit();
     }
 
-    pub fn find(self: *const ManagedConfig, name: []const u8) ?*const SourceRepo {
+    /// Resolves a source by name or label.
+    pub fn find(self: *const ManagedConfig, key: []const u8) ?*const SourceRepo {
         for (self.value.sources) |*source| {
-            if (std.mem.eql(u8, source.name, name)) return source;
+            if (std.mem.eql(u8, source.name, key)) return source;
+            if (source.label) |label| if (std.mem.eql(u8, label, key)) return source;
         }
         return null;
     }
@@ -53,12 +80,20 @@ pub const ManagedConfig = struct {
         @memcpy(sources[0..self.value.sources.len], self.value.sources);
         sources[sources.len - 1] = .{
             .name = try a.dupe(u8, source.name),
+            .label = try dupeOptional(a, source.label),
             .url = try a.dupe(u8, source.url),
-            .ref = if (source.ref) |ref| try a.dupe(u8, ref) else null,
+            .path = try dupeOptional(a, source.path),
+            .target = try dupeOptional(a, source.target),
+            .claude_sync = source.claude_sync,
+            .ref = try dupeOptional(a, source.ref),
         };
         self.value.sources = sources;
     }
 };
+
+fn dupeOptional(a: std.mem.Allocator, s: ?[]const u8) error{OutOfMemory}!?[]const u8 {
+    return if (s) |value| try a.dupe(u8, value) else null;
+}
 
 /// Reads `sub_path` from `dir`. A missing file yields the defaults (config
 /// well-formedness); a present file must be a valid v1 config.
@@ -102,15 +137,51 @@ pub fn save(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, cfg: Config) !voi
 pub const ValidateError = error{
     DuplicateSourceName,
     InvalidName,
+    InvalidRelPath,
 };
 
+/// Names and labels share one namespace, so `find` is unambiguous.
 pub fn validate(cfg: Config) ValidateError!void {
+    if (cfg.default_search_path) |p| try validateRelPath(p);
     for (cfg.sources, 0..) |s, i| {
         try validateName(s.name);
+        if (s.label) |label| {
+            try validateName(label);
+            if (std.mem.eql(u8, label, s.name)) return error.DuplicateSourceName;
+        }
+        if (s.path) |p| try validateRelPath(p);
+        if (s.target) |p| try validateRelPath(p);
         for (cfg.sources[0..i]) |o| {
-            if (std.mem.eql(u8, o.name, s.name)) return error.DuplicateSourceName;
+            if (sharesKey(o, s.name)) return error.DuplicateSourceName;
+            if (s.label) |label| if (sharesKey(o, label)) return error.DuplicateSourceName;
         }
     }
+}
+
+fn sharesKey(source: SourceRepo, key: []const u8) bool {
+    if (std.mem.eql(u8, source.name, key)) return true;
+    const label = source.label orelse return false;
+    return std.mem.eql(u8, label, key);
+}
+
+/// Non-empty, relative, NUL-free, no empty/`.`/`..` component; trailing `/`
+/// ignored (confinement).
+pub fn validateRelPath(path: []const u8) ValidateError!void {
+    const p = trimRelPath(path);
+    if (p.len == 0 or p.len > 1024 or p[0] == '/') return error.InvalidRelPath;
+    if (std.mem.indexOfScalar(u8, p, 0) != null) return error.InvalidRelPath;
+    var it = std.mem.splitScalar(u8, p, '/');
+    while (it.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, "..")) return error.InvalidRelPath;
+    }
+}
+
+/// Drops trailing slashes.
+pub fn trimRelPath(path: []const u8) []const u8 {
+    if (path.len != 0 and std.mem.allEqual(u8, path, '/')) return path[0..1];
+    return std.mem.trimEnd(u8, path, "/");
 }
 
 /// `[A-Za-z0-9._-]+`, not `.` or `..`, must not start with `-` or `.`,
@@ -209,8 +280,9 @@ test "source lookup uses names and normalized URLs" {
     };
     defer managed.deinit();
 
-    try managed.append(.{ .name = "skills", .url = "HTTPS://host/org/skills.git/", .ref = "main" });
+    try managed.append(.{ .name = "skills", .label = "sk", .url = "HTTPS://host/org/skills.git/", .ref = "main" });
     try std.testing.expectEqualStrings("skills", managed.find("skills").?.name);
+    try std.testing.expectEqualStrings("skills", managed.find("sk").?.name);
     try std.testing.expect(managed.find("missing") == null);
     try std.testing.expectEqualStrings("skills", managed.findUrl("https://host/org/skills").?.name);
     try std.testing.expect(managed.findUrl("ssh://host/org/skills") == null);
@@ -235,7 +307,14 @@ fn appendAllocationFailures(a: std.mem.Allocator) !void {
     };
     defer managed.deinit();
 
-    managed.append(.{ .name = "skills", .url = "https://host/skills.git", .ref = "main" }) catch |e| {
+    managed.append(.{
+        .name = "skills",
+        .label = "sk",
+        .url = "https://host/skills.git",
+        .path = ".agents/skills",
+        .target = ".agents/skills",
+        .ref = "main",
+    }) catch |e| {
         try std.testing.expectEqual(@as(usize, 0), managed.value.sources.len);
         return e;
     };
@@ -304,6 +383,61 @@ test "load defaults and unknown fields (b: illustrative, hand-editable config)" 
     var future = try load(a, io, t.dir, "config.json");
     defer future.deinit();
     try std.testing.expectEqual(@as(u32, 1), future.value.version);
+}
+
+test "validate keeps names and labels one unique namespace (b: illustrative table)" {
+    const ok: []const SourceRepo = &.{
+        .{ .name = "a", .label = "x", .url = "u" },
+        .{ .name = "b", .url = "v" },
+    };
+    try validate(.{ .sources = ok });
+    const clashes = [_][]const SourceRepo{
+        &.{ .{ .name = "a", .url = "u" }, .{ .name = "a", .url = "v" } },
+        &.{.{ .name = "a", .label = "a", .url = "u" }},
+        &.{ .{ .name = "a", .label = "x", .url = "u" }, .{ .name = "x", .url = "v" } },
+        &.{ .{ .name = "a", .url = "u" }, .{ .name = "b", .label = "a", .url = "v" } },
+        &.{ .{ .name = "a", .label = "x", .url = "u" }, .{ .name = "b", .label = "x", .url = "v" } },
+    };
+    for (clashes) |sources| {
+        try std.testing.expectError(error.DuplicateSourceName, validate(.{ .sources = sources }));
+    }
+    try std.testing.expectError(
+        error.InvalidName,
+        validate(.{ .sources = &.{.{ .name = "a", .label = "-x", .url = "u" }} }),
+    );
+}
+
+test "validateRelPath rejects escapes and empty components (b: illustrative table)" {
+    const good = [_][]const u8{ ".agents/skills", ".agents/skills/", "a", ".claude/skills", "a/.b/c" };
+    for (good) |p| try validateRelPath(p);
+    const bad = [_][]const u8{ "", "/", "/abs", "a/../b", "..", ".", "a//b", "./a", "a/./b", "a\x00b" };
+    for (bad) |p| try std.testing.expectError(error.InvalidRelPath, validateRelPath(p));
+    try std.testing.expectError(
+        error.InvalidRelPath,
+        validate(.{ .default_search_path = "../up" }),
+    );
+    try std.testing.expectError(
+        error.InvalidRelPath,
+        validate(.{ .sources = &.{.{ .name = "a", .url = "u", .target = "/etc" }} }),
+    );
+}
+
+test "searchPath and linkSubdirs resolve defaults (b: illustrative)" {
+    const cfg: Config = .{ .default_search_path = "skills/" };
+    try std.testing.expectEqualStrings("skills", (SourceRepo{ .name = "a", .url = "u" }).searchPath(cfg));
+    try std.testing.expectEqualStrings("own", (SourceRepo{ .name = "a", .url = "u", .path = "own" }).searchPath(cfg));
+    try std.testing.expectEqualStrings("", (SourceRepo{ .name = "a", .url = "u" }).searchPath(.{}));
+
+    var buf: [2][]const u8 = undefined;
+    const both = (SourceRepo{ .name = "a", .url = "u", .target = ".agents/skills" }).linkSubdirs(&buf);
+    try std.testing.expectEqual(@as(usize, 2), both.len);
+    try std.testing.expectEqualStrings(".agents/skills", both[0]);
+    try std.testing.expectEqualStrings(claude_skills_dir, both[1]);
+    const no_sync = (SourceRepo{ .name = "a", .url = "u", .claude_sync = false }).linkSubdirs(&buf);
+    try std.testing.expectEqual(@as(usize, 1), no_sync.len);
+    try std.testing.expectEqualStrings("", no_sync[0]);
+    const already = (SourceRepo{ .name = "a", .url = "u", .target = ".claude/skills/" }).linkSubdirs(&buf);
+    try std.testing.expectEqual(@as(usize, 1), already.len);
 }
 
 test "save writes indented JSON with a trailing newline (b: illustrative)" {
