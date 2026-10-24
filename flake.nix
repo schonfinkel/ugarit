@@ -28,6 +28,7 @@
 
   outputs =
     inputs@{
+      self,
       flake-parts,
       nixpkgs,
       ...
@@ -39,6 +40,14 @@
       ];
 
       systems = nixpkgs.lib.systems.flakeExposed;
+
+      flake = {
+        overlays.default = final: _prev: {
+          ugarit = self.packages.${final.stdenv.hostPlatform.system}.default;
+        };
+        nixosModules.default = import ./nix/nixos-module.nix self;
+        homeManagerModules.default = import ./nix/home-module.nix self;
+      };
 
       perSystem =
         {
@@ -118,6 +127,13 @@
                 ln -s ${zigDependencies} "$ZIG_GLOBAL_CACHE_DIR/p"
               '';
               zigBuildFlags = [ "-Doptimize=ReleaseSafe" ];
+              meta = {
+                description = "Link agent skills from Git repositories into projects";
+                homepage = "https://github.com/schonfinkel/ugarit";
+                license = lib.licenses.gpl3Only;
+                mainProgram = "ugarit";
+                platforms = lib.platforms.unix;
+              };
             };
           }
           // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {

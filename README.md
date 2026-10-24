@@ -14,6 +14,47 @@ nix build
 ./result/bin/ugarit --version
 ```
 
+Try it without installing:
+
+```sh
+nix run github:schonfinkel/ugarit -- --help
+```
+
+### NixOS / Home Manager
+
+Add the flake as an input (`ugarit.url = "github:schonfinkel/ugarit";`), then either
+install it system-wide:
+
+```nix
+{
+  imports = [ inputs.ugarit.nixosModules.default ];
+  programs.ugarit.enable = true;
+}
+```
+
+or per user, optionally managing `config.json` declaratively (`ugarit source-sync`
+clones newly declared sources):
+
+```nix
+{
+  imports = [ inputs.ugarit.homeManagerModules.default ];
+  programs.ugarit = {
+    enable = true;
+    settings = {
+      version = 1;
+      default_search_path = ".agents/skills";
+      sources = [{
+        name = "skills";
+        url = "ssh://git@my-awesome-forge.com/some-urser/some-repo.git";
+        target = ".agents/skills";
+      }];
+    };
+  };
+}
+```
+
+`overlays.default` adds `pkgs.ugarit` for any other setup.
+
 Or enter the development shell and build with Zig 0.16:
 
 ```sh
@@ -59,9 +100,9 @@ ugarit unlink --skill my-skill
 ## Commands
 
 ```text
-source-add <url> [--name <name>] [--ref <ref>]
+source-add <url> [--name <name>] [--label <label>] [--path <dir>] [--target <dir>] [--no-claude-sync] [--ref <ref>]
 source-sync [name]
-link <source> <skill> [dest-dir...] [--as <name>] [--force] [--mkdir] [--no-exclude]
+link <source|label> <skill> <dest-dir...> [--as <name>] [--force] [--mkdir] [--no-exclude]
 unlink <link-path>...
 unlink --skill <name>
 list [skill] [--source <name>] [--links]

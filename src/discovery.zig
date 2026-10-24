@@ -164,11 +164,29 @@ pub fn scan(a: std.mem.Allocator, io: std.Io, sources_dir: ?std.Io.Dir, cfg: con
             else => return e,
         };
         defer root.close(io);
-        if (try isRegularFile(io, root, "SKILL.md")) { // single-skill repo (edge case 25)
-            try addSkill(a, &skills, sources_real, src.name, src.name, ".");
+        const search = src.searchPath(cfg);
+        var search_root = openSearchRoot(io, root, search) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir, error.SymLinkLoop => {
+                try warn(a, &warnings, "source '{s}' has no directory '{s}'", .{ src.name, search });
+                continue;
+            },
+            else => return e,
+        };
+        defer if (search.len != 0) search_root.close(io);
+        if (try isRegularFile(io, search_root, "SKILL.md")) { // single-skill root (edge case 25)
+            if (search.len == 0) {
+                try addSkill(a, &skills, sources_real, src.name, src.name, ".");
+                continue;
+            }
+            const name = std.fs.path.basename(search);
+            config.validateName(name) catch {
+                try warn(a, &warnings, "invalid skill name {s}/{s}", .{ src.name, search });
+                continue;
+            };
+            try addSkill(a, &skills, sources_real, src.name, name, search);
             continue;
         }
-        try walk(a, io, root, sources_real, src.name, "", 0, &skills, &warnings);
+        try walk(a, io, search_root, sources_real, src.name, search, 0, &skills, &warnings);
     }
 
     const owned = try skills.toOwnedSlice(a);
@@ -179,6 +197,23 @@ pub fn scan(a: std.mem.Allocator, io: std.Io, sources_dir: ?std.Io.Dir, cfg: con
         .skills = owned,
         .warnings = try warnings.toOwnedSlice(a),
     };
+}
+
+/// Opens `search` component-wise without following symlinks (confinement).
+/// Hidden components are allowed. `""` returns `root` itself.
+fn openSearchRoot(io: std.Io, root: std.Io.Dir, search: []const u8) !std.Io.Dir {
+    if (search.len == 0) return root;
+    var it = std.mem.splitScalar(u8, search, '/');
+    var current = root;
+    var owned = false;
+    errdefer if (owned) current.close(io);
+    while (it.next()) |component| {
+        const next = try current.openDir(io, component, .{ .iterate = true, .follow_symlinks = false });
+        if (owned) current.close(io);
+        current = next;
+        owned = true;
+    }
+    return current;
 }
 
 fn walk(
@@ -384,4 +419,48 @@ test "scan releases partial results under every OOM (a: exhaustive allocation fa
         scanAllocationFailures,
         .{ScanOomContext{ .io = io, .sources = sources }},
     );
+}
+
+test "search paths reach hidden skill roots and stay confined (b: illustrative)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    try t.dir.createDirPath(io, "central/.agents/skills/zig");
+    try t.dir.writeFile(io, .{ .sub_path = "central/.agents/skills/zig/SKILL.md", .data = "z\n" });
+    try t.dir.createDirPath(io, "single/tools/one");
+    try t.dir.writeFile(io, .{ .sub_path = "single/tools/one/SKILL.md", .data = "o\n" });
+    try t.dir.createDirPath(io, "outside/bait");
+    try t.dir.writeFile(io, .{ .sub_path = "outside/bait/SKILL.md", .data = "b\n" });
+    try t.dir.createDirPath(io, "esc");
+    try t.dir.symLink(io, "../outside", "esc/escape", .{ .is_directory = true });
+    var sources = try t.dir.openDir(io, ".", .{ .iterate = true });
+    defer sources.close(io);
+
+    // Without a search path the hidden `.agents` tree is invisible.
+    var hidden = try scan(a, io, sources, .{ .sources = &.{.{ .name = "central", .url = "/u" }} });
+    defer hidden.deinit(a);
+    try std.testing.expect(hidden.lookupInSource("central", "zig") == .missing);
+
+    var idx = try scan(a, io, sources, .{
+        .default_search_path = ".agents/skills",
+        .sources = &.{
+            .{ .name = "central", .url = "/u" },
+            .{ .name = "single", .url = "/v", .path = "tools/one/" },
+            .{ .name = "esc", .url = "/w", .path = "escape" },
+        },
+    });
+    defer idx.deinit(a);
+    switch (idx.lookupInSource("central", "zig")) {
+        .found => |s| try std.testing.expectEqualStrings(".agents/skills/zig", s.rel_path),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (idx.lookupInSource("single", "one")) {
+        .found => |s| try std.testing.expectEqualStrings("tools/one", s.rel_path),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 2), idx.skills.len);
+    // A symlinked search root is refused.
+    try std.testing.expectEqual(@as(usize, 1), idx.warnings.len);
+    try std.testing.expect(std.mem.indexOf(u8, idx.warnings[0], "'esc' has no directory") != null);
 }

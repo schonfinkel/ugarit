@@ -184,16 +184,47 @@ test "validateName boundary classes" {
 // well-formedness).
 // ---------------------------------------------------------------------------
 
+/// Component pool for constructively valid relative paths.
+const rel_components = [_][]const u8{ ".agents", "skills", "a", "b.c", ".claude" };
+
+/// 1–3 component indices plus a trailing-slash flag.
+const RelPathSeed = struct {
+    parts: []const u8,
+    trailing_slash: bool,
+};
+
+const rel_path_seed_gen = gen.structure(RelPathSeed, .{
+    .parts = gen.list(u8, gen.intRange(u8, 0, rel_components.len - 1), 1, 3),
+    .trailing_slash = gen.boolean(),
+});
+
+fn buildRelPath(a: std.mem.Allocator, seed: RelPathSeed) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    for (seed.parts, 0..) |part, i| {
+        if (i != 0) try out.append(a, '/');
+        try out.appendSlice(a, rel_components[part]);
+    }
+    if (seed.trailing_slash) try out.append(a, '/');
+    return out.toOwnedSlice(a);
+}
+
 const SourceSeed = struct {
     suffix: []const u8,
     url: []const u8,
     has_ref: bool,
     ref_val: []const u8,
+    has_label: bool,
+    has_path: bool,
+    path: RelPathSeed,
+    has_target: bool,
+    target: RelPathSeed,
+    claude_sync: bool,
 };
 
 const ConfigSeed = struct {
-    has_default_path: bool,
-    default_path: []const u8,
+    has_default_search_path: bool,
+    default_search_path: RelPathSeed,
     sources: []const SourceSeed,
 };
 
@@ -202,24 +233,37 @@ const source_seed_gen = gen.structure(SourceSeed, .{
     .url = gen.string(.{ .min_len = 0, .max_len = 24, .charset = .printable }),
     .has_ref = gen.boolean(),
     .ref_val = gen.string(.{ .min_len = 0, .max_len = 8, .charset = .printable }),
+    .has_label = gen.boolean(),
+    .has_path = gen.boolean(),
+    .path = rel_path_seed_gen,
+    .has_target = gen.boolean(),
+    .target = rel_path_seed_gen,
+    .claude_sync = gen.boolean(),
 });
 
 const config_seed_gen = gen.structure(ConfigSeed, .{
-    .has_default_path = gen.boolean(),
-    .default_path = gen.string(.{ .min_len = 1, .max_len = 24, .charset = .printable }),
+    .has_default_search_path = gen.boolean(),
+    .default_search_path = rel_path_seed_gen,
     .sources = gen.list(SourceSeed, source_seed_gen, 0, 5),
 });
 
+fn expectOptionalStrings(expected: ?[]const u8, actual: ?[]const u8) !void {
+    try expectEqual(expected == null, actual == null);
+    if (expected) |e| try expectEqualStrings(e, actual.?);
+}
+
 fn expectConfigEqual(expected: config.Config, actual: config.Config) !void {
     try expectEqual(expected.version, actual.version);
-    try expectEqual(expected.default_path == null, actual.default_path == null);
-    if (expected.default_path) |path| try expectEqualStrings(path, actual.default_path.?);
+    try expectOptionalStrings(expected.default_search_path, actual.default_search_path);
     try expectEqual(expected.sources.len, actual.sources.len);
     for (expected.sources, actual.sources) |e, o| {
         try expectEqualStrings(e.name, o.name);
+        try expectOptionalStrings(e.label, o.label);
         try expectEqualStrings(e.url, o.url);
-        try expectEqual(e.ref == null, o.ref == null);
-        if (e.ref) |er| try expectEqualStrings(er, o.ref.?);
+        try expectOptionalStrings(e.path, o.path);
+        try expectOptionalStrings(e.target, o.target);
+        try expectEqual(e.claude_sync, o.claude_sync);
+        try expectOptionalStrings(e.ref, o.ref);
     }
 }
 
@@ -230,14 +274,22 @@ fn configRoundTrip(seed: ConfigSeed) !void {
 
     const sources = try a.alloc(config.SourceRepo, seed.sources.len);
     for (seed.sources, 0..) |s, i| {
+        // `s`/`l` prefixes keep names and labels collision-free.
         sources[i] = .{
             .name = try std.fmt.allocPrint(a, "s{d}{s}", .{ i, s.suffix }),
+            .label = if (s.has_label) try std.fmt.allocPrint(a, "l{d}{s}", .{ i, s.suffix }) else null,
             .url = s.url,
+            .path = if (s.has_path) try buildRelPath(a, s.path) else null,
+            .target = if (s.has_target) try buildRelPath(a, s.target) else null,
+            .claude_sync = s.claude_sync,
             .ref = if (s.has_ref) s.ref_val else null,
         };
     }
     const cfg: config.Config = .{
-        .default_path = if (seed.has_default_path) seed.default_path else null,
+        .default_search_path = if (seed.has_default_search_path)
+            try buildRelPath(a, seed.default_search_path)
+        else
+            null,
         .sources = sources,
     };
 
@@ -308,6 +360,126 @@ fn configSpecificRejections(i: usize) !void {
 
 test "config load rejects malformed and invalid configs with the documented error" {
     for (0..5) |i| try configSpecificRejections(i);
+}
+
+// ---------------------------------------------------------------------------
+// Property: `validateRelPath` accepts exactly the relative, NUL-free paths
+// that `resolvePosix` leaves unchanged under a root (invariant: confinement).
+// ---------------------------------------------------------------------------
+
+fn relPathSpec(a: std.mem.Allocator, p: []const u8) !bool {
+    if (p.len == 0 or p[0] == '/') return false;
+    if (std.mem.indexOfScalar(u8, p, 0) != null) return false;
+    const resolved = try std.fs.path.resolvePosix(a, &.{ "/r", p });
+    defer a.free(resolved);
+    const want = try std.fmt.allocPrint(a, "/r/{s}", .{std.mem.trimEnd(u8, p, "/")});
+    defer a.free(want);
+    return std.mem.eql(u8, resolved, want);
+}
+
+fn validateRelPathMatchesSpec(p: []const u8) !void {
+    const expected = try relPathSpec(std.testing.allocator, p);
+    const actual = if (config.validateRelPath(p)) |_| true else |_| false;
+    if (expected != actual) {
+        std.debug.print("validateRelPath({any}): spec {} impl {}\n", .{ p, expected, actual });
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "validateRelPath agrees with POSIX resolution" {
+    // Tiny alphabet: `.`, `..`, `//`, leading `/` and NUL are common.
+    try minish.check(
+        std.testing.allocator,
+        gen.string(.{ .min_len = 0, .max_len = 10, .charset = .custom, .custom_chars = "a./\x00" }),
+        validateRelPathMatchesSpec,
+        .{ .seed = 0x4e1, .num_runs = 2000 },
+    );
+}
+
+test "constructed relative paths always validate" {
+    try minish.check(std.testing.allocator, rel_path_seed_gen, struct {
+        fn prop(seed: RelPathSeed) !void {
+            const p = try buildRelPath(std.testing.allocator, seed);
+            defer std.testing.allocator.free(p);
+            try config.validateRelPath(p);
+        }
+    }.prop, .{ .seed = 0x4e2, .num_runs = 300 });
+}
+
+// ---------------------------------------------------------------------------
+// Property: `validate` succeeds iff all names and labels are valid and
+// distinct, and then `find` maps each key to its source (invariant: config
+// well-formedness).
+// ---------------------------------------------------------------------------
+
+/// Small pools force collisions; `-x` is an invalid label.
+const key_pool = [_][]const u8{ "a", "b", "c" };
+const label_pool = [_][]const u8{ "a", "b", "c", "-x" };
+
+const KeySeed = struct { name: u8, has_label: bool, label: u8 };
+
+fn namespaceModel(seeds: []const KeySeed) !void {
+    var sources_buf: [4]config.SourceRepo = undefined;
+    const n = @min(seeds.len, sources_buf.len);
+    for (seeds[0..n], 0..) |k, i| {
+        sources_buf[i] = .{
+            .name = key_pool[k.name],
+            .label = if (k.has_label) label_pool[k.label] else null,
+            .url = "u",
+        };
+    }
+    const sources = sources_buf[0..n];
+
+    var keys_buf: [8][]const u8 = undefined;
+    var keys_len: usize = 0;
+    var any_invalid = false;
+    for (sources) |s| {
+        keys_buf[keys_len] = s.name;
+        keys_len += 1;
+        if (s.label) |l| {
+            if (l[0] == '-') any_invalid = true;
+            keys_buf[keys_len] = l;
+            keys_len += 1;
+        }
+    }
+    const keys = keys_buf[0..keys_len];
+    var any_duplicate = false;
+    for (keys, 0..) |k, i| {
+        for (keys[0..i]) |o| if (std.mem.eql(u8, k, o)) {
+            any_duplicate = true;
+        };
+    }
+
+    const cfg: config.Config = .{ .sources = sources };
+    if (config.validate(cfg)) |_| {
+        try std.testing.expect(!any_invalid and !any_duplicate);
+        const managed: config.ManagedConfig = .{
+            .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+            .value = cfg,
+        };
+        for (sources) |*s| {
+            try std.testing.expectEqual(s, managed.find(s.name).?);
+            if (s.label) |l| try std.testing.expectEqual(s, managed.find(l).?);
+        }
+    } else |err| {
+        try std.testing.expect(any_invalid or any_duplicate);
+        if (!any_invalid) try expectEqual(error.DuplicateSourceName, err);
+    }
+}
+
+const key_seed_gen = gen.structure(KeySeed, .{
+    .name = gen.intRange(u8, 0, key_pool.len - 1),
+    .has_label = gen.boolean(),
+    .label = gen.intRange(u8, 0, label_pool.len - 1),
+});
+
+test "names and labels form one unique, resolvable namespace" {
+    try minish.check(
+        std.testing.allocator,
+        gen.list(KeySeed, key_seed_gen, 0, 4),
+        namespaceModel,
+        .{ .seed = 0x1abe1, .num_runs = 500 },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -859,6 +1031,120 @@ fn scanMatchesOracle(spec: TreeSpec) !void {
     }
     try expectEqual(symlink_warnings, got_symlink_warnings);
     try std.testing.expect(got_ghost_warning);
+}
+
+// ---------------------------------------------------------------------------
+// Property (metamorphic): scanning a tree nested under `path = P` equals
+// scanning it at the clone root with `rel_path` prefixed by `P`; a root skill
+// takes `P`'s basename (invariant: discovery determinism).
+// ---------------------------------------------------------------------------
+
+const SearchSpec = struct {
+    root_skill: bool,
+    path: RelPathSeed,
+    k: [p6_containers.len][p6_names.len]u8, // 0 absent, 1 skill, 2 plain dir, 3 hidden skill
+};
+
+fn plantTree(io: std.Io, sources: std.Io.Dir, prefix: []const u8, spec: SearchSpec) !void {
+    const a = std.testing.allocator;
+    try sources.createDirPath(io, prefix);
+    if (spec.root_skill) {
+        const full = try std.fs.path.join(a, &.{ prefix, "SKILL.md" });
+        defer a.free(full);
+        try sources.writeFile(io, .{ .sub_path = full, .data = "root\n" });
+    }
+    for (p6_containers, 0..) |cont, ci| {
+        for (p6_names, 0..) |name, ni| {
+            const rel = switch (spec.k[ci][ni]) {
+                0 => continue,
+                1, 2 => try std.fmt.allocPrint(a, "{s}{s}", .{ cont, name }),
+                3 => try std.fmt.allocPrint(a, "{s}.{s}", .{ cont, name }),
+                else => unreachable,
+            };
+            defer a.free(rel);
+            if (spec.k[ci][ni] == 2) {
+                const dir = try std.fs.path.join(a, &.{ prefix, rel });
+                defer a.free(dir);
+                try sources.createDirPath(io, dir);
+            } else try writeSkillMd(io, sources, prefix, rel);
+        }
+    }
+}
+
+fn searchPathIsMetamorphic(spec: SearchSpec) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    var sources = try t.dir.openDir(io, ".", .{ .iterate = true });
+    defer sources.close(io);
+
+    const search_raw = try buildRelPath(a, spec.path);
+    defer a.free(search_raw);
+    const search = config.trimRelPath(search_raw);
+    const nested_root = try std.fs.path.join(a, &.{ "nested", search });
+    defer a.free(nested_root);
+    try plantTree(io, sources, "flat", spec);
+    try plantTree(io, sources, nested_root, spec);
+
+    var idx = try discovery.scan(a, io, sources, .{ .sources = &.{
+        .{ .name = "flat", .url = "/f" },
+        .{ .name = "nested", .url = "/n", .path = search_raw },
+    } });
+    defer idx.deinit(a);
+
+    var flat_count: usize = 0;
+    var nested_count: usize = 0;
+    for (idx.skills) |s| {
+        if (std.mem.eql(u8, s.source, "nested")) nested_count += 1 else flat_count += 1;
+    }
+    const base = std.fs.path.basename(search);
+    const root_named = if (config.validateName(base)) |_| true else |_| false;
+    const root_lost = spec.root_skill and !root_named;
+    try expectEqual(flat_count - @intFromBool(root_lost), nested_count);
+
+    for (idx.skills) |s| {
+        if (!std.mem.eql(u8, s.source, "flat")) continue;
+        const want_rel = if (std.mem.eql(u8, s.rel_path, "."))
+            try a.dupe(u8, search)
+        else
+            try std.fmt.allocPrint(a, "{s}/{s}", .{ search, s.rel_path });
+        defer a.free(want_rel);
+        const want_name = if (std.mem.eql(u8, s.rel_path, ".")) base else s.name;
+        if (std.mem.eql(u8, s.rel_path, ".") and !root_named) continue;
+        const query = try std.fmt.allocPrint(a, "nested/{s}", .{want_rel});
+        defer a.free(query);
+        switch (idx.lookup(query)) {
+            .found => |got| try expectEqualStrings(want_name, got.name),
+            else => {
+                std.debug.print("missing {s} (search '{s}')\n", .{ query, search_raw });
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+    if (root_lost) {
+        var warned = false;
+        for (idx.warnings) |w| {
+            if (std.mem.startsWith(u8, w, "invalid skill name nested/")) warned = true;
+        }
+        try std.testing.expect(warned);
+    }
+}
+
+test "scanning under a search path is the root scan, prefixed" {
+    const spec_gen = gen.structure(SearchSpec, .{
+        .root_skill = gen.boolean(),
+        .path = rel_path_seed_gen,
+        .k = gen.array(
+            [p6_names.len]u8,
+            p6_containers.len,
+            gen.array(u8, p6_names.len, gen.intRange(u8, 0, 3)),
+        ),
+    });
+    try minish.check(std.testing.allocator, spec_gen, searchPathIsMetamorphic, .{
+        .seed = 0x5ea4c4,
+        .num_runs = 80,
+    });
 }
 
 // ---------------------------------------------------------------------------
