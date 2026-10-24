@@ -291,6 +291,27 @@ test "binary link resolves labels, search paths, targets and claude_sync" {
         try expectExit(0, result);
         try std.testing.expectStringStartsWith(result.stdout, "personal  up-to-date\n");
     }
+    {
+        // A hand-declared source is cloned by the next sync.
+        var root_dir = try std.Io.Dir.openDirAbsolute(io, ugarit_home, .{});
+        defer root_dir.close(io);
+        var cfg = try ugarit.config.load(a, io, root_dir, "config.json");
+        defer cfg.deinit();
+        try cfg.append(.{ .name = "hand", .url = team_origin });
+        try ugarit.config.save(a, io, root_dir, cfg.value);
+    }
+    {
+        const result = try run(a, io, exe, &env, &.{ "source-sync", "hand" });
+        defer result.deinit(a);
+        try expectExit(0, result);
+        try std.testing.expectEqualStrings("hand  cloned\n", result.stdout);
+    }
+    {
+        const result = try run(a, io, exe, &env, &.{ "list", "--source", "hand" });
+        defer result.deinit(a);
+        try expectExit(0, result);
+        try std.testing.expectEqualStrings("hand/zig  0 links\n", result.stdout);
+    }
 }
 
 test "binary list on a fresh home creates nothing" {

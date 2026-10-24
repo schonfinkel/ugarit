@@ -362,7 +362,6 @@ pub fn sourceAdd(ctx: *Context, url: []const u8, options: SourceAddOptions) !voi
         try ctx.err.writeAll("warning: URL contains credentials and is stored in plain text\n");
     }
 
-    try sweepCloneTemps(ctx);
     const old_sources = ctx.cfg.value.sources;
     try ctx.cfg.append(.{
         .name = name,
@@ -380,11 +379,7 @@ pub fn sourceAdd(ctx: *Context, url: []const u8, options: SourceAddOptions) !voi
     // Reject clashing labels and bad paths before cloning.
     try config.validate(ctx.cfg.value);
 
-    const url_z = try ctx.a.dupeZ(u8, url);
-    defer ctx.a.free(url_z);
-    const ref_z = if (options.ref) |ref| try ctx.a.dupeZ(u8, ref) else null;
-    defer if (ref_z) |ref| ctx.a.free(ref);
-    try git.clone(ctx.a, ctx.io, ctx.sourcesDir(), ctx.env, url_z, name, ref_z);
+    try cloneSource(ctx, .{ .name = name, .url = url, .ref = options.ref });
     var persisted = false;
     errdefer if (!persisted) ctx.sourcesDir().deleteTree(ctx.io, name) catch {};
     try failAt(.before_config_save);
@@ -395,6 +390,15 @@ pub fn sourceAdd(ctx: *Context, url: []const u8, options: SourceAddOptions) !voi
     try ctx.out.writeAll("added ");
     try config.redact(ctx.out, url);
     try ctx.out.print(" as {s}\n", .{name});
+}
+
+fn cloneSource(ctx: *Context, source: config.SourceRepo) !void {
+    try sweepCloneTemps(ctx);
+    const url_z = try ctx.a.dupeZ(u8, source.url);
+    defer ctx.a.free(url_z);
+    const ref_z = if (source.ref) |ref| try ctx.a.dupeZ(u8, ref) else null;
+    defer if (ref_z) |ref| ctx.a.free(ref);
+    try git.clone(ctx.a, ctx.io, ctx.sourcesDir(), ctx.env, url_z, source.name, ref_z);
 }
 
 pub fn sourceSync(ctx: *Context, selected: ?[]const u8) !bool {
@@ -412,6 +416,20 @@ pub fn sourceSync(ctx: *Context, selected: ?[]const u8) !bool {
     var all_ok = true;
     for (ctx.cfg.value.sources, 0..) |source, i| {
         if (selected_name) |name| if (!std.mem.eql(u8, name, source.name)) continue;
+        // Sources declared by hand (or on another host) are cloned on first sync.
+        if (ctx.sourcesDir().access(ctx.io, source.name, .{ .follow_symlinks = false })) |_| {} else |err| switch (err) {
+            error.FileNotFound => {
+                cloneSource(ctx, source) catch |clone_err| {
+                    try ctx.report(source.name, clone_err);
+                    all_ok = false;
+                    continue;
+                };
+                synced[i] = true;
+                try ctx.out.print("{s}  cloned\n", .{source.name});
+                continue;
+            },
+            else => return err,
+        }
         const repo_z = try std.fmt.allocPrintSentinel(ctx.a, "{s}/{s}", .{ ctx.sources_real, source.name }, 0);
         defer ctx.a.free(repo_z);
         var credentials: git.CredState = .{ .env = ctx.env };
