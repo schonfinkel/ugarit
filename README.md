@@ -45,7 +45,7 @@ clones newly declared sources):
       default_search_path = ".agents/skills";
       sources = [{
         name = "skills";
-        url = "ssh://git@codeberg.org/schonfinkel/skills.git";
+        url = "ssh://git@my-awesome-forge.com/some-urser/some-repo.git";
         target = ".agents/skills";
       }];
     };
@@ -100,9 +100,9 @@ ugarit unlink --skill my-skill
 ## Commands
 
 ```text
-source-add <url> [--name <name>] [--ref <ref>]
+source-add <url> [--name <name>] [--label <label>] [--path <dir>] [--target <dir>] [--no-claude-sync] [--ref <ref>]
 source-sync [name]
-link <source> <skill> [dest-dir...] [--as <name>] [--force] [--mkdir] [--no-exclude]
+link <source|label> <skill> <dest-dir...> [--as <name>] [--force] [--mkdir] [--no-exclude]
 unlink <link-path>...
 unlink --skill <name>
 list [skill] [--source <name>] [--links]

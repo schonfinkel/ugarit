@@ -17,7 +17,7 @@ Code comments name these guarantees in words rather than by number. The identifi
 
 ### Link correctness
 
-- **Confinement (`I4`)**: Every link target ugarit writes is an absolute path to a directory under `realpath(sources/<source>)` that contains a regular `SKILL.md`.
+- **Confinement (`I4`)**: Every link target ugarit writes is an absolute path to a directory under `realpath(sources/<source>)` that contains a regular `SKILL.md`. Search paths and link subdirectories are relative and `..`-free, and a search root is never reached through a symlink.
 - **Fan-out coherence (`I5`)**: All registry links of one `(source, rel_path)` resolve to the same directory (same inode), so a write to the source is visible through every link.
 - **Idempotence (`I6`)**: `link(s, D)` twice yields the same filesystem state and registry as once; `unlink` twice equals once; `source-sync` with no upstream change makes zero filesystem changes.
 - **Inverse (`I7`)**: `unlink(link(s, D))` restores the dest directories and the registry to their prior state, modulo the `info/exclude` line, which is allowed to stay.

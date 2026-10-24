@@ -28,7 +28,7 @@ in
           default_search_path = ".agents/skills";
           sources = [{
             name = "skills";
-            url = "ssh://git@codeberg.org/schonfinkel/skills.git";
+            url = "ssh://git@my-awesome-forge.com/some-urser/some-repo.git";
             target = ".agents/skills";
           }];
         }
