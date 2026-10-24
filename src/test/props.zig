@@ -1034,6 +1034,120 @@ fn scanMatchesOracle(spec: TreeSpec) !void {
 }
 
 // ---------------------------------------------------------------------------
+// Property (metamorphic): scanning a tree nested under `path = P` equals
+// scanning it at the clone root with `rel_path` prefixed by `P`; a root skill
+// takes `P`'s basename (invariant: discovery determinism).
+// ---------------------------------------------------------------------------
+
+const SearchSpec = struct {
+    root_skill: bool,
+    path: RelPathSeed,
+    k: [p6_containers.len][p6_names.len]u8, // 0 absent, 1 skill, 2 plain dir, 3 hidden skill
+};
+
+fn plantTree(io: std.Io, sources: std.Io.Dir, prefix: []const u8, spec: SearchSpec) !void {
+    const a = std.testing.allocator;
+    try sources.createDirPath(io, prefix);
+    if (spec.root_skill) {
+        const full = try std.fs.path.join(a, &.{ prefix, "SKILL.md" });
+        defer a.free(full);
+        try sources.writeFile(io, .{ .sub_path = full, .data = "root\n" });
+    }
+    for (p6_containers, 0..) |cont, ci| {
+        for (p6_names, 0..) |name, ni| {
+            const rel = switch (spec.k[ci][ni]) {
+                0 => continue,
+                1, 2 => try std.fmt.allocPrint(a, "{s}{s}", .{ cont, name }),
+                3 => try std.fmt.allocPrint(a, "{s}.{s}", .{ cont, name }),
+                else => unreachable,
+            };
+            defer a.free(rel);
+            if (spec.k[ci][ni] == 2) {
+                const dir = try std.fs.path.join(a, &.{ prefix, rel });
+                defer a.free(dir);
+                try sources.createDirPath(io, dir);
+            } else try writeSkillMd(io, sources, prefix, rel);
+        }
+    }
+}
+
+fn searchPathIsMetamorphic(spec: SearchSpec) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    var sources = try t.dir.openDir(io, ".", .{ .iterate = true });
+    defer sources.close(io);
+
+    const search_raw = try buildRelPath(a, spec.path);
+    defer a.free(search_raw);
+    const search = config.trimRelPath(search_raw);
+    const nested_root = try std.fs.path.join(a, &.{ "nested", search });
+    defer a.free(nested_root);
+    try plantTree(io, sources, "flat", spec);
+    try plantTree(io, sources, nested_root, spec);
+
+    var idx = try discovery.scan(a, io, sources, .{ .sources = &.{
+        .{ .name = "flat", .url = "/f" },
+        .{ .name = "nested", .url = "/n", .path = search_raw },
+    } });
+    defer idx.deinit(a);
+
+    var flat_count: usize = 0;
+    var nested_count: usize = 0;
+    for (idx.skills) |s| {
+        if (std.mem.eql(u8, s.source, "nested")) nested_count += 1 else flat_count += 1;
+    }
+    const base = std.fs.path.basename(search);
+    const root_named = if (config.validateName(base)) |_| true else |_| false;
+    const root_lost = spec.root_skill and !root_named;
+    try expectEqual(flat_count - @intFromBool(root_lost), nested_count);
+
+    for (idx.skills) |s| {
+        if (!std.mem.eql(u8, s.source, "flat")) continue;
+        const want_rel = if (std.mem.eql(u8, s.rel_path, "."))
+            try a.dupe(u8, search)
+        else
+            try std.fmt.allocPrint(a, "{s}/{s}", .{ search, s.rel_path });
+        defer a.free(want_rel);
+        const want_name = if (std.mem.eql(u8, s.rel_path, ".")) base else s.name;
+        if (std.mem.eql(u8, s.rel_path, ".") and !root_named) continue;
+        const query = try std.fmt.allocPrint(a, "nested/{s}", .{want_rel});
+        defer a.free(query);
+        switch (idx.lookup(query)) {
+            .found => |got| try expectEqualStrings(want_name, got.name),
+            else => {
+                std.debug.print("missing {s} (search '{s}')\n", .{ query, search_raw });
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+    if (root_lost) {
+        var warned = false;
+        for (idx.warnings) |w| {
+            if (std.mem.startsWith(u8, w, "invalid skill name nested/")) warned = true;
+        }
+        try std.testing.expect(warned);
+    }
+}
+
+test "scanning under a search path is the root scan, prefixed" {
+    const spec_gen = gen.structure(SearchSpec, .{
+        .root_skill = gen.boolean(),
+        .path = rel_path_seed_gen,
+        .k = gen.array(
+            [p6_names.len]u8,
+            p6_containers.len,
+            gen.array(u8, p6_names.len, gen.intRange(u8, 0, 3)),
+        ),
+    });
+    try minish.check(std.testing.allocator, spec_gen, searchPathIsMetamorphic, .{
+        .seed = 0x5ea4c4,
+        .num_runs = 80,
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Property: `classify` × `link` over every pre-existing entry kind × `force`
 // matches the decision table; real entries survive (invariants: ownership,
 // idempotence).
