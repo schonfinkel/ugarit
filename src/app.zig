@@ -340,6 +340,10 @@ fn openOptional(io: std.Io, abs: []const u8, options: std.Io.Dir.OpenOptions) !s
 
 pub const SourceAddOptions = struct {
     name: ?[]const u8 = null,
+    label: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    target: ?[]const u8 = null,
+    claude_sync: bool = true,
     ref: ?[]const u8 = null,
 };
 
@@ -360,11 +364,21 @@ pub fn sourceAdd(ctx: *Context, url: []const u8, options: SourceAddOptions) !voi
 
     try sweepCloneTemps(ctx);
     const old_sources = ctx.cfg.value.sources;
-    try ctx.cfg.append(.{ .name = name, .url = url, .ref = options.ref });
+    try ctx.cfg.append(.{
+        .name = name,
+        .label = options.label,
+        .url = url,
+        .path = options.path,
+        .target = options.target,
+        .claude_sync = options.claude_sync,
+        .ref = options.ref,
+    });
     var config_persisted = false;
     errdefer {
         if (!config_persisted) ctx.cfg.value.sources = old_sources;
     }
+    // Reject clashing labels and bad paths before cloning.
+    try config.validate(ctx.cfg.value);
 
     const url_z = try ctx.a.dupeZ(u8, url);
     defer ctx.a.free(url_z);
@@ -387,14 +401,17 @@ pub fn sourceSync(ctx: *Context, selected: ?[]const u8) !bool {
     var lock_file = try paths_mod.lock(ctx.io, ctx.rootDir());
     defer lock_file.close(ctx.io);
     try ctx.reload();
-    if (selected) |name| if (ctx.cfg.find(name) == null) return error.SourceNotFound;
+    const selected_name = if (selected) |key|
+        (ctx.cfg.find(key) orelse return error.SourceNotFound).name
+    else
+        null;
 
     const synced = try ctx.a.alloc(bool, ctx.cfg.value.sources.len);
     defer ctx.a.free(synced);
     @memset(synced, false);
     var all_ok = true;
     for (ctx.cfg.value.sources, 0..) |source, i| {
-        if (selected) |name| if (!std.mem.eql(u8, name, source.name)) continue;
+        if (selected_name) |name| if (!std.mem.eql(u8, name, source.name)) continue;
         const repo_z = try std.fmt.allocPrintSentinel(ctx.a, "{s}/{s}", .{ ctx.sources_real, source.name }, 0);
         defer ctx.a.free(repo_z);
         var credentials: git.CredState = .{ .env = ctx.env };
@@ -443,9 +460,10 @@ pub const LinkOptions = struct {
     no_exclude: bool = false,
 };
 
+/// Links a skill into each destination's `linkSubdirs`.
 pub fn link(
     ctx: *Context,
-    source: []const u8,
+    source_key: []const u8,
     query: []const u8,
     destinations: anytype,
     options: LinkOptions,
@@ -454,14 +472,14 @@ pub fn link(
     var lock_file = try paths_mod.lock(ctx.io, ctx.rootDir());
     defer lock_file.close(ctx.io);
     try ctx.reload();
-    if (ctx.cfg.find(source) == null) return error.SourceNotFound;
+    const source = ctx.cfg.find(source_key) orelse return error.SourceNotFound;
     var idx = try ctx.scan();
     defer idx.deinit(ctx.a);
-    const skill = switch (idx.lookupInSource(source, query)) {
+    const skill = switch (idx.lookupInSource(source.name, query)) {
         .found => |skill| skill,
         .missing => return error.SkillNotFound,
         .ambiguous => {
-            try ctx.err.print("ugarit: '{s}/{s}' is ambiguous:\n", .{ source, query });
+            try ctx.err.print("ugarit: '{s}/{s}' is ambiguous:\n", .{ source.name, query });
             try ctx.err.writeAll("  use the source-relative skill path\n");
             return error.AmbiguousSkill;
         },
@@ -469,14 +487,61 @@ pub fn link(
     const name = options.as orelse skill.name;
     try config.validateName(name);
 
+    var subdirs_buf: [2][]const u8 = undefined;
+    const subdirs = source.linkSubdirs(&subdirs_buf);
     var all_ok = true;
     for (destinations) |raw| {
-        linkOne(ctx, skill, name, raw, options) catch |err| {
-            try ctx.report(raw, err);
-            all_ok = false;
-        };
+        // Subdirs resolving to the same directory are linked once.
+        var seen: [subdirs_buf.len]?[]u8 = @splat(null);
+        defer for (seen) |s| if (s) |path| ctx.a.free(path);
+        for (subdirs, 0..) |subdir, i| {
+            // A destination that already is `.claude/skills` gets no nested copy.
+            if (std.mem.eql(u8, subdir, config.claude_skills_dir) and isClaudeSkillsDir(ctx, raw)) continue;
+            const dest = if (subdir.len == 0)
+                try ctx.a.dupe(u8, raw)
+            else
+                try std.fs.path.join(ctx.a, &.{ raw, subdir });
+            defer ctx.a.free(dest);
+            if (paths_mod.canonicalDestPath(ctx.a, ctx.io, ctx.home, dest)) |canonical| {
+                seen[i] = canonical;
+                const duplicate = for (seen[0..i]) |prior| {
+                    if (prior) |p| if (std.mem.eql(u8, p, canonical)) break true;
+                } else false;
+                if (duplicate) continue;
+            } else |_| {} // `linkOne` reports the same failure below
+
+            var one = options;
+            // Subdirs are created on demand; the destination itself is not.
+            if (subdir.len != 0) {
+                requireDestRoot(ctx, raw, options.mkdir) catch |err| {
+                    try ctx.report(raw, err);
+                    all_ok = false;
+                    break;
+                };
+                one.mkdir = true;
+            }
+            linkOne(ctx, skill, name, dest, one) catch |err| {
+                try ctx.report(dest, err);
+                all_ok = false;
+            };
+        }
     }
     return all_ok;
+}
+
+fn isClaudeSkillsDir(ctx: *Context, raw: []const u8) bool {
+    const canonical = paths_mod.canonicalDestPath(ctx.a, ctx.io, ctx.home, raw) catch return false;
+    defer ctx.a.free(canonical);
+    return std.mem.endsWith(u8, canonical, "/" ++ config.claude_skills_dir);
+}
+
+/// `FileNotFound` unless `raw` exists or `mkdir` is set.
+fn requireDestRoot(ctx: *Context, raw: []const u8, mkdir: bool) !void {
+    if (mkdir) return;
+    const root = try paths_mod.canonicalDestPath(ctx.a, ctx.io, ctx.home, raw);
+    defer ctx.a.free(root);
+    var dir = try std.Io.Dir.openDirAbsolute(ctx.io, root, .{});
+    dir.close(ctx.io);
 }
 
 pub fn linkOne(
@@ -628,7 +693,11 @@ pub const ListOptions = struct {
     links: bool = false,
 };
 
-pub fn list(ctx: *Context, query: ?[]const u8, options: ListOptions) !void {
+pub fn list(ctx: *Context, query: ?[]const u8, list_options: ListOptions) !void {
+    var options = list_options;
+    if (options.source) |key| if (ctx.cfg.find(key)) |source| {
+        options.source = source.name;
+    };
     var idx = try ctx.scan();
     defer idx.deinit(ctx.a);
     for (idx.warnings) |warning| try ctx.err.print("warning: {s}\n", .{warning});

@@ -156,6 +156,143 @@ test "binary usage errors exit two" {
     try expectExit(2, result);
 }
 
+test "binary link resolves labels, search paths, targets and claude_sync" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const exe_ptr = getenv("UGARIT_EXE") orelse return error.MissingUgaritExe;
+    const exe = std.mem.span(exe_ptr);
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    var libgit = try ugarit.git.fixtures.Libgit2.init();
+    defer libgit.deinit();
+
+    const personal_origin = try ugarit.git.fixtures.initOrigin(a, io, t.dir, "personal-origin");
+    defer a.free(personal_origin);
+    try ugarit.git.fixtures.commitFile(io, personal_origin, ".agents/skills/zig/SKILL.md", "personal\n");
+    const team_origin = try ugarit.git.fixtures.initOrigin(a, io, t.dir, "team-origin");
+    defer a.free(team_origin);
+    try ugarit.git.fixtures.commitFile(io, team_origin, "zig/SKILL.md", "team\n");
+    try t.dir.createDirPath(io, "home");
+    try t.dir.createDirPath(io, "project");
+    try t.dir.createDirPath(io, "plain");
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try t.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+    const home = try std.fs.path.join(a, &.{ root, "home" });
+    defer a.free(home);
+    const ugarit_home = try std.fs.path.join(a, &.{ home, "ugarit" });
+    defer a.free(ugarit_home);
+    const project = try std.fs.path.join(a, &.{ root, "project" });
+    defer a.free(project);
+    const plain = try std.fs.path.join(a, &.{ root, "plain" });
+    defer a.free(plain);
+    const missing = try std.fs.path.join(a, &.{ root, "missing" });
+    defer a.free(missing);
+
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+    try env.put("UGARIT_HOME", ugarit_home);
+
+    {
+        const result = try run(a, io, exe, &env, &.{
+            "source-add", personal_origin,  "--name",   "personal",       "--label", "me",
+            "--path",     ".agents/skills", "--target", ".agents/skills",
+        });
+        defer result.deinit(a);
+        try expectExit(0, result);
+    }
+    {
+        const result = try run(a, io, exe, &env, &.{
+            "source-add", team_origin, "--name", "team", "--no-claude-sync",
+        });
+        defer result.deinit(a);
+        try expectExit(0, result);
+    }
+    {
+        // A label colliding with a name is rejected.
+        const result = try run(a, io, exe, &env, &.{ "source-add", team_origin, "--name", "x", "--label", "team" });
+        defer result.deinit(a);
+        try expectExit(1, result);
+    }
+
+    {
+        // A destination is required.
+        const result = try run(a, io, exe, &env, &.{ "link", "me", "zig" });
+        defer result.deinit(a);
+        try expectExit(2, result);
+    }
+    {
+        // A missing destination is not created.
+        const result = try run(a, io, exe, &env, &.{ "link", "me", "zig", missing, "--no-exclude" });
+        defer result.deinit(a);
+        try expectExit(1, result);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, missing, .{}));
+    }
+    {
+        const result = try run(a, io, exe, &env, &.{ "link", "me", "zig", project, "--no-exclude" });
+        defer result.deinit(a);
+        try expectExit(0, result);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, result.stdout, "created "));
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "-> personal/.agents/skills/zig") != null);
+    }
+    {
+        const result = try run(a, io, exe, &env, &.{ "link", "me", "zig", project, "--no-exclude" });
+        defer result.deinit(a);
+        try expectExit(0, result);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, result.stdout, "unchanged "));
+    }
+    {
+        const result = try run(a, io, exe, &env, &.{ "link", "team", "zig", plain, "--no-exclude" });
+        defer result.deinit(a);
+        try expectExit(0, result);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, result.stdout, "created "));
+    }
+
+    {
+        // `.claude/skills` aliasing `.agents/skills` gets a single link.
+        try t.dir.createDirPath(io, "aliased/.agents/skills");
+        try t.dir.createDirPath(io, "aliased/.claude");
+        try t.dir.symLink(io, "../.agents/skills", "aliased/.claude/skills", .{ .is_directory = true });
+        const aliased = try std.fs.path.join(a, &.{ root, "aliased" });
+        defer a.free(aliased);
+        const result = try run(a, io, exe, &env, &.{ "link", "me", "zig", aliased, "--no-exclude" });
+        defer result.deinit(a);
+        try expectExit(0, result);
+        try std.testing.expectEqualStrings("created ", result.stdout[0..8]);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, result.stdout, "\n"));
+    }
+
+    for ([_]struct { rel: []const u8, content: []const u8 }{
+        .{ .rel = "project/.agents/skills/zig/SKILL.md", .content = "personal\n" },
+        .{ .rel = "project/.claude/skills/zig/SKILL.md", .content = "personal\n" },
+        .{ .rel = "plain/zig/SKILL.md", .content = "team\n" },
+    }) |expected| {
+        const full = try std.fs.path.join(a, &.{ root, expected.rel });
+        defer a.free(full);
+        const content = try std.Io.Dir.cwd().readFileAlloc(io, full, a, .limited(64));
+        defer a.free(content);
+        try std.testing.expectEqualStrings(expected.content, content);
+    }
+    const plain_claude = try std.fs.path.join(a, &.{ plain, ".claude" });
+    defer a.free(plain_claude);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.accessAbsolute(io, plain_claude, .{}));
+
+    {
+        const result = try run(a, io, exe, &env, &.{ "list", "--source", "me", "--links" });
+        defer result.deinit(a);
+        try expectExit(0, result);
+        try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, result.stdout, "  ok\n"));
+    }
+    {
+        const result = try run(a, io, exe, &env, &.{ "source-sync", "me" });
+        defer result.deinit(a);
+        try expectExit(0, result);
+        try std.testing.expectStringStartsWith(result.stdout, "personal  up-to-date\n");
+    }
+}
+
 test "binary list on a fresh home creates nothing" {
     const a = std.testing.allocator;
     const io = std.testing.io;

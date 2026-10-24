@@ -10,6 +10,10 @@ const Cli = struct {
     __commands__: union(enum) {
         @"source-add": struct {
             name: ?[]const u8 = null,
+            label: ?[]const u8 = null,
+            path: ?[]const u8 = null,
+            target: ?[]const u8 = null,
+            @"no-claude-sync": bool = false,
             ref: ?[]const u8 = null,
             help: bool = false,
         },
@@ -35,8 +39,8 @@ const Cli = struct {
 
         pub const __messages__ = .{
             .@"source-add" = "Register and clone a Git repository source: <url>",
-            .@"source-sync" = "Fetch and fast-forward sources, then repair links: [name]",
-            .link = "Symlink a source skill: <source> <skill> <dest-dir...>",
+            .@"source-sync" = "Fetch and fast-forward sources, then repair links: [name|label]",
+            .link = "Symlink a source skill: <source|label> <skill> <dest-dir...>",
             .unlink = "Remove managed links: <link-path>... | --skill <name>",
             .list = "List skills and link status: [skill]",
         };
@@ -104,15 +108,36 @@ pub fn main(init: std.process.Init) !u8 {
 fn dispatch(ctx: *ugarit.app.Context, command: @FieldType(Cli, "__commands__"), args: []const [:0]const u8) !bool {
     return switch (command) {
         .@"source-add" => |options| blk: {
-            var parsed = ugarit.app.SourceAddOptions{ .name = options.name, .ref = options.ref };
+            var parsed = ugarit.app.SourceAddOptions{
+                .name = options.name,
+                .label = options.label,
+                .path = options.path,
+                .target = options.target,
+                .claude_sync = !options.@"no-claude-sync",
+                .ref = options.ref,
+            };
             var url: ?[]const u8 = null;
             var i: usize = 0;
             while (i < args.len) : (i += 1) {
                 const arg = args[i];
-                if (std.mem.eql(u8, arg, "--name") or std.mem.eql(u8, arg, "--ref")) {
+                const slot: ?*?[]const u8 = if (std.mem.eql(u8, arg, "--name"))
+                    &parsed.name
+                else if (std.mem.eql(u8, arg, "--label"))
+                    &parsed.label
+                else if (std.mem.eql(u8, arg, "--path"))
+                    &parsed.path
+                else if (std.mem.eql(u8, arg, "--target"))
+                    &parsed.target
+                else if (std.mem.eql(u8, arg, "--ref"))
+                    &parsed.ref
+                else
+                    null;
+                if (slot) |field| {
                     i += 1;
                     if (i == args.len) return error.Usage;
-                    if (std.mem.eql(u8, arg, "--name")) parsed.name = args[i] else parsed.ref = args[i];
+                    field.* = args[i];
+                } else if (std.mem.eql(u8, arg, "--no-claude-sync")) {
+                    parsed.claude_sync = false;
                 } else if (std.mem.startsWith(u8, arg, "--")) {
                     return error.Usage;
                 } else if (url == null) {
