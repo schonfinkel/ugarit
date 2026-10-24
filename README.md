@@ -14,6 +14,47 @@ nix build
 ./result/bin/ugarit --version
 ```
 
+Try it without installing:
+
+```sh
+nix run github:schonfinkel/ugarit -- --help
+```
+
+### NixOS / Home Manager
+
+Add the flake as an input (`ugarit.url = "github:schonfinkel/ugarit";`), then either
+install it system-wide:
+
+```nix
+{
+  imports = [ inputs.ugarit.nixosModules.default ];
+  programs.ugarit.enable = true;
+}
+```
+
+or per user, optionally managing `config.json` declaratively (`ugarit source-sync`
+clones newly declared sources):
+
+```nix
+{
+  imports = [ inputs.ugarit.homeManagerModules.default ];
+  programs.ugarit = {
+    enable = true;
+    settings = {
+      version = 1;
+      default_search_path = ".agents/skills";
+      sources = [{
+        name = "skills";
+        url = "ssh://git@codeberg.org/schonfinkel/skills.git";
+        target = ".agents/skills";
+      }];
+    };
+  };
+}
+```
+
+`overlays.default` adds `pkgs.ugarit` for any other setup.
+
 Or enter the development shell and build with Zig 0.16:
 
 ```sh
