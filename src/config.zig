@@ -80,9 +80,9 @@ pub fn load(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, sub_path: []const
     return managed;
 }
 
-/// Atomically writes `config.json` into `dir` (failure atomicity).
+/// Atomically writes an indented `config.json` into `dir` (failure atomicity).
 pub fn save(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, cfg: Config) !void {
-    const bytes = serde.json.toSlice(a, cfg) catch |err| switch (err) {
+    const bytes = serde.json.toSliceWith(a, cfg, .{ .pretty = true, .indent = 2 }) catch |err| switch (err) {
         // serde's allocating writer erases allocator failure to WriteFailed.
         error.WriteFailed => return error.OutOfMemory,
         else => return err,
@@ -94,6 +94,7 @@ pub fn save(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, cfg: Config) !voi
     var buf: [4096]u8 = undefined;
     var w = af.file.writer(io, &buf);
     try w.interface.writeAll(bytes);
+    try w.interface.writeAll("\n");
     try w.flush();
     try af.replace(io);
 }
@@ -303,4 +304,16 @@ test "load defaults and unknown fields (b: illustrative, hand-editable config)" 
     var future = try load(a, io, t.dir, "config.json");
     defer future.deinit();
     try std.testing.expectEqual(@as(u32, 1), future.value.version);
+}
+
+test "save writes indented JSON with a trailing newline (b: illustrative)" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var t = std.testing.tmpDir(.{});
+    defer t.cleanup();
+    try save(a, io, t.dir, .{ .sources = &.{.{ .name = "skills", .url = "u" }} });
+    const bytes = try t.dir.readFileAlloc(io, "config.json", a, .limited(4096));
+    defer a.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "\n  \"sources\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, bytes, "}\n"));
 }
